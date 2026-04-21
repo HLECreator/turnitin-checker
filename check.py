@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Turnitin AI Checker — v0.1
+Turnitin AI Checker — v0.4
 Run: python check.py <document.docx|document.pdf>
 Output: <docname>_packet.md — drag into Claude.ai (Opus) for a flagged HTML report.
+
+v0.4 — Shawn BP2 calibration update (13 reports, ~476 segments):
+- S4 split into S4a (generic LLM vocab) and S4b (consulting-register cluster — true fingerprint)
+- Severity weights lowered to correct prior over-prediction (76% predicted vs 20% actual, −56pt miss)
+- HIGH severity requires S4b presence (gating rule)
+- Grammatical-noise moderator: prompts Claude to reduce severity one step when noise is present
+- S2/S3/S6 downgraded to correlates — they no longer flag on their own without S4b co-occurrence
 """
 
 import sys
@@ -38,6 +45,62 @@ HEDGE_PHRASES = [
     "a number of",
     "in today's",
 ]
+
+# S4b — consulting-register cluster (the true flagging fingerprint).
+# Three patterns: abstract-noun chains, nominalised outcomes, abstract-noun triplets.
+# A paragraph is S4b-positive when it contains 2+ hits combined.
+
+# Pattern 1 — abstract-noun chain phrases (noun-of-abstract-noun constructions)
+S4B_CHAIN_PATTERNS = [
+    r"\b(assimilation|integration|optimisation|optimization|transformation|"
+    r"implementation|facilitation|realisation|realization|consolidation|"
+    r"augmentation|enhancement|alignment|cultivation|orchestration|"
+    r"standardisation|standardization|harmonisation|harmonization|"
+    r"amplification|elevation|proliferation) of\b",
+    r"\bshift to (technology|digital|integrated|holistic|comprehensive|seamless)",
+    r"\btransition(al)? (shift|move|progression) to\b",
+    r"\b(ecosystem|paradigm|framework|landscape) of (digital|integrated|holistic)",
+]
+
+# Pattern 2 — nominalised outcome verbs (AI-favoured active verbs with abstract objects)
+S4B_NOMINAL_PATTERNS = [
+    r"\b(enables?|drives?|fosters?|facilitates?|empowers?|elevates?|"
+    r"streamlines?|optimi[sz]es?|leverages?|cultivates?|orchestrates?|"
+    r"catalys(es|ts?)|accelerates?|underpins?|underscores?) "
+    r"(enhanced|seamless|holistic|comprehensive|integrated|strategic|"
+    r"sustainable|scalable|robust|transformative|innovative)\b",
+    r"\b(coordination|alignment|engagement|adoption|delivery|accessibility|"
+    r"scalability|interoperability) across\b",
+]
+
+# Pattern 3 — abstract-noun triplet construction (three nominalised outcomes)
+# Heuristic: three verbs-that-become-abstract in a row, connected by commas + and
+S4B_TRIPLET_PATTERN = re.compile(
+    r"\b(aggregate|enhance|streamline|optimi[sz]e|facilitate|foster|empower|"
+    r"drive|deliver|elevate|consolidate|integrate|leverage|cultivate|"
+    r"orchestrate|accelerate)\w*\s+[\w\s\-]{1,40},\s+"
+    r"(enhanc|streamlin|optimi[sz]|facilitat|foster|empower|drive|deliver|"
+    r"elevat|consolidat|integrat|leverag|cultivat|orchestrat|accelerat)\w*\s+[\w\s\-]{1,40},?\s+and\s+"
+    r"(enhanc|streamlin|optimi[sz]|facilitat|foster|empower|drive|deliver|"
+    r"elevat|consolidat|integrat|leverag|cultivat|orchestrat|accelerat)\w*\s+[\w\s\-]{1,40}",
+    re.IGNORECASE,
+)
+
+S4B_CHAIN_RE = [re.compile(p, re.IGNORECASE) for p in S4B_CHAIN_PATTERNS]
+S4B_NOMINAL_RE = [re.compile(p, re.IGNORECASE) for p in S4B_NOMINAL_PATTERNS]
+
+# Grammatical-noise moderator heuristic: detect common signs of noisy prose.
+# This is deliberately conservative — false negatives are safer than false positives.
+NOISE_PATTERNS = [
+    r"\s{2,}\w",                        # double-spaces mid-sentence (typo artefact)
+    r"\b[a-z]+[A-Z][a-z]+\b",           # camelCase mid-word (OCR/paste artefact)
+    r"\bis are\b|\bare is\b|\bhas have\b|\bhave has\b",  # agreement errors
+    r"\b(a|an)\s+[aeiouAEIOU]",         # "a apple" type errors (rough)
+    r"\b(the the|and and|of of|to to|in in)\b",  # accidental doubling
+    r"[\.\,\;\:\?\!]{2,}",              # double punctuation
+    r"\w\s+[\.\,\;\:]\s*\w",            # space before punctuation
+]
+NOISE_RE = [re.compile(p) for p in NOISE_PATTERNS]
 
 FORMULAIC_OPENERS = [
     r"^in today['\u2019]s",
@@ -155,27 +218,58 @@ def has_formulaic_opener(text: str) -> bool:
     return any(re.search(pat, first, re.IGNORECASE) for pat in FORMULAIC_OPENERS)
 
 
+def s4b_hits(text: str) -> dict:
+    """
+    Count consulting-register cluster hits — the true flagging fingerprint.
+    Returns {chain, nominal, triplet, total}. S4b-positive when total >= 2.
+    """
+    chain = sum(len(r.findall(text)) for r in S4B_CHAIN_RE)
+    nominal = sum(len(r.findall(text)) for r in S4B_NOMINAL_RE)
+    triplet = len(S4B_TRIPLET_PATTERN.findall(text))
+    return {
+        "chain": chain,
+        "nominal": nominal,
+        "triplet": triplet,
+        "total": chain + nominal + (triplet * 2),  # triplets weighted double
+    }
+
+
+def noise_hits(text: str) -> int:
+    """Rough grammatical-noise heuristic — count matches across all patterns."""
+    return sum(len(r.findall(text)) for r in NOISE_RE)
+
+
 def ruler_pass(paragraph: str) -> dict:
     sentences = split_sentences(paragraph)
     flags = []
     metrics = {}
 
-    # S2 — sentence length uniformity
+    # S2 — sentence length uniformity (correlate only — does not flag alone)
     if len(sentences) >= MIN_SENTENCES:
         stdev = sentence_length_stdev(sentences)
         metrics["sent_stdev"] = round(stdev, 1)
-        if stdev < STDEV_FLAG_BELOW:
-            flags.append("S2")
+        s2_hit = stdev < STDEV_FLAG_BELOW
     else:
         metrics["sent_stdev"] = "n/a"
+        s2_hit = False
+    metrics["s2_correlate"] = s2_hit
 
-    # S4 — hedge/connective density
+    # S4a — generic LLM vocabulary density (hedge-based heuristic)
     hd = hedge_density(paragraph)
     metrics["hedge_pct"] = f"{hd:.0%}"
     if hd > HEDGE_FLAG_ABOVE:
-        flags.append("S4")
+        flags.append("S4a")
 
-    # S6 — formulaic opener
+    # S4b — consulting-register cluster (the true fingerprint)
+    s4b = s4b_hits(paragraph)
+    metrics["s4b_chain"] = s4b["chain"]
+    metrics["s4b_nominal"] = s4b["nominal"]
+    metrics["s4b_triplet"] = s4b["triplet"]
+    metrics["s4b_total"] = s4b["total"]
+    if s4b["total"] >= 2:
+        flags.append("S4b")
+
+    # S6 — formulaic opener (correlate only — moderated by grammatical noise)
     opener = has_formulaic_opener(paragraph)
     metrics["formulaic_opener"] = opener
     if opener:
@@ -187,7 +281,7 @@ def ruler_pass(paragraph: str) -> dict:
     if ttr < TTR_FLAG_BELOW:
         flags.append("S8")
 
-    # S3 partial — synthesis closer in last sentence
+    # S3 partial — synthesis closer in last sentence (correlate only)
     last_sentence = sentences[-1] if sentences else paragraph
     if SYNTHESIS_CLOSER.search(last_sentence):
         flags.append("S3")
@@ -201,6 +295,15 @@ def ruler_pass(paragraph: str) -> dict:
     if triplet_count >= 2:
         flags.append("S5")
 
+    # Promote S2 to a flag only when S4b co-occurs (per calibration rule)
+    if s2_hit and "S4b" in flags:
+        flags.append("S2")
+
+    # Grammatical-noise moderator count
+    noise = noise_hits(paragraph)
+    metrics["noise_hits"] = noise
+    metrics["noisy"] = noise >= 3
+
     return {"flags": flags, "metrics": metrics}
 
 
@@ -213,15 +316,49 @@ def load_file(name: str, script_dir: Path) -> str:
     return f"[{name} not found — place it alongside check.py]\n"
 
 
-def severity(flags: list) -> str:
-    n = len(flags)
-    if n == 0:
-        return "CLEAR"
-    if n == 1:
-        return "LOW"
-    if n == 2:
-        return "MEDIUM"
-    return "HIGH"
+def severity(flags: list, metrics: dict = None) -> str:
+    """
+    Classify paragraph severity with v0.4 calibration rules:
+
+    - HIGH requires S4b presence (consulting-register cluster). Without S4b,
+      severity caps at MEDIUM regardless of other signal count.
+    - Grammatical noise (metrics["noisy"]) reduces severity by one step as a
+      passive clearance moderator (Shawn BP2 calibration).
+    - S2, S3, S6 alone are correlates — count them at half weight when S4b
+      is absent.
+    """
+    if not flags:
+        base = "CLEAR"
+    else:
+        # Separate S4b from correlates
+        has_s4b = "S4b" in flags
+        correlate_flags = [f for f in flags if f in {"S2", "S3", "S6", "S5", "S7", "S8"}]
+        strong_flags = [f for f in flags if f in {"S1", "S4a", "S4b"}]
+
+        if has_s4b:
+            # S4b present — score by total signal count normally
+            n = len(flags)
+            if n >= 4:
+                base = "HIGH"
+            elif n >= 2:
+                base = "MEDIUM"
+            else:
+                base = "LOW"
+        else:
+            # No S4b — cap at MEDIUM, downweight correlates
+            effective = len(strong_flags) + (len(correlate_flags) / 2)
+            if effective >= 2.5:
+                base = "MEDIUM"
+            elif effective >= 1.0:
+                base = "LOW"
+            else:
+                base = "CLEAR"
+
+    # Grammatical-noise moderator: step down one level
+    if metrics and metrics.get("noisy"):
+        base = {"HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "CLEAR", "CLEAR": "CLEAR"}[base]
+
+    return base
 
 
 def estimate_ai_score(paragraphs: list, results: list) -> int:
@@ -229,15 +366,20 @@ def estimate_ai_score(paragraphs: list, results: list) -> int:
     Word-weighted AI score estimate. Mirrors Turnitin's logic:
     flagged words / total qualifying words.
 
-    Calibration notes (v0.3):
-    - These are RULER-ONLY weights (Streamlit preview). They are intentionally higher than
-      the packet weights Claude uses, because the ruler misses S1/S3(full)/S7 and needs
-      compensation. Two-point corpus calibration: G9 ruler→54% vs Turnitin 62%.
-    - Claude's HTML report uses separate weights (HIGH=0.90, MEDIUM=0.65, LOW=0.20)
-      calibrated on a rewritten proposal: Claude→36% vs Turnitin 33% (delta 3 pts).
+    Calibration notes (v0.4 — Shawn BP2 update):
+    - Prior weights (HIGH=0.95, MEDIUM=0.75) over-predicted Shawn BP2 by 56 points
+      (predicted 76%, actual 20%). Weights lowered to reflect that HIGH without
+      S4b is rare and that MEDIUM paragraphs often only contribute ~30–50% of
+      their word count to actual flagging.
+    - Ruler-only weights (this function): HIGH=0.75, MEDIUM=0.45, LOW=0.15.
+    - Claude's HTML report prompt now uses: HIGH=0.70, MEDIUM=0.40, LOW=0.12.
     - Paragraphs under 50 words excluded from denominator (document furniture).
+    - Validation history:
+        G9 ruler→54% vs Turnitin 62% (v0.3 under-prediction, −8pt)
+        Shawn BP2 Claude→76% vs Turnitin 20% (v0.3 over-prediction, −56pt)
+        Spinability rewrite Claude→36% vs Turnitin 33% (v0.3 fit, +3pt)
     """
-    SEV_WEIGHT    = {"HIGH": 0.95, "MEDIUM": 0.75, "LOW": 0.25, "CLEAR": 0.0}
+    SEV_WEIGHT    = {"HIGH": 0.75, "MEDIUM": 0.45, "LOW": 0.15, "CLEAR": 0.0}
     MIN_SCORE_WDS = 50  # below this, paragraph is furniture — skip from denominator
     total_words   = 0
     flagged_words = 0.0
@@ -246,7 +388,8 @@ def estimate_ai_score(paragraphs: list, results: list) -> int:
         if wc < MIN_SCORE_WDS:
             continue  # exclude furniture from denominator
         total_words   += wc
-        flagged_words += wc * SEV_WEIGHT[severity(result["flags"])]
+        sev = severity(result["flags"], result.get("metrics"))
+        flagged_words += wc * SEV_WEIGHT[sev]
     if total_words == 0:
         return 0
     return round(flagged_words / total_words * 100)
@@ -260,37 +403,71 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
     lines.append("## Instructions for Claude\n\n")
     lines.append(
         "You are a Turnitin AI-detection expert trained on a live research playbook "
-        "covering 8 corpora, 12 reports, and ~450 flagged segments from IMU BCP2485 proposals.\n\n"
+        "covering 8 corpora, 13 reports, and ~476 flagged segments from IMU BCP2485 proposals.\n\n"
         "This packet contains:\n"
-        "1. **Signal reference (S1–S8)** and **Technique reference (T1–T8)**\n"
+        "1. **Signal reference (S1–S8, with S4 split into S4a/S4b)** and **Technique reference (T1–T8)**\n"
         "2. **Before/after examples** from the real corpus\n"
         "3. **The document under review**, split into numbered paragraphs with a ruler-pass "
         "fingerprint showing which measurable signals each paragraph tripped\n\n"
         "### Your task\n\n"
         "For each paragraph:\n"
         "- Review the ruler fingerprint AND the paragraph text\n"
-        "- Identify ALL applicable signals (including S1, S3, S5, S7 which the ruler cannot measure)\n"
-        "- Assign severity: **HIGH** (≥3 signals) · **MEDIUM** (2) · **LOW** (1) · **CLEAR** (0)\n"
+        "- Identify ALL applicable signals (including S1, S3(full), S7 which the ruler cannot fully measure)\n"
+        "- **Specifically assess S4b (consulting-register cluster) by reading** — the ruler's "
+        "pattern-matching catches obvious forms but will miss paraphrased variants. Look for the "
+        "three S4b patterns: abstract-noun chains, nominalised outcomes, abstract-noun triplets. "
+        "Run the diagnostic: strip every concrete noun from a candidate sentence — if it still parses, "
+        "the cluster is present.\n"
+        "- Assign severity using the v0.4 calibration rules below.\n"
         "- For every HIGH or MEDIUM paragraph, write a **concrete rewrite suggestion** "
-        "naming the specific T-technique(s) applied\n\n"
+        "naming the specific T-technique(s) applied. Prioritise T5b (consulting-register cluster "
+        "removal) — it is the single highest-impact technique when S4b is present.\n\n"
+        "### Severity rules (v0.4 — mandatory)\n\n"
+        "- **HIGH severity REQUIRES S4b presence.** A paragraph without the consulting-register "
+        "cluster (abstract-noun chains, nominalised outcomes, or abstract-noun triplets) caps at "
+        "MEDIUM regardless of how many other signals fire. This is the single most important "
+        "calibration rule — it prevents the overprediction pattern that caused a 76% → 20% miss "
+        "on Shawn BP2.\n"
+        "- **S2, S3, S6 alone do not flag.** Uniform sentence length, scaffolded shape, and "
+        "meta-openers are correlates that amplify S4b. Without S4b, they are insufficient on their "
+        "own to push a paragraph above LOW.\n"
+        "- **Count**: with S4b → HIGH (≥4 signals), MEDIUM (2–3), LOW (1). "
+        "Without S4b → cap at MEDIUM, downweight correlates by half.\n"
+        "- **Grammatical-noise moderator**: if the paragraph contains visible grammatical noise "
+        "(broken syntax, typos, agreement errors, awkward phrasing, run-on fragments), reduce "
+        "classified severity by **one step** (HIGH→MEDIUM, MEDIUM→LOW). The ruler fingerprint "
+        "flags this with the `GRAMMATICAL_NOISE` tag, but you should also apply it when you read "
+        "noise the ruler missed. Noise is a passive clearance mechanism observed in Shawn BP2 — "
+        "do NOT advise writers to introduce typos; just account for their suppressing effect.\n\n"
         "### Calibration patterns to watch for\n\n"
-        "Three patterns have been validated against Turnitin post-hoc and require special handling "
-        "— they are the most common source of severity miscalibration:\n\n"
+        "Four patterns have been validated against Turnitin post-hoc and require special handling "
+        "— they are the most common sources of severity miscalibration:\n\n"
+        "- **S4b-gating (the big one).** The consulting-register cluster is THE flagging "
+        "fingerprint. A paragraph with clean topic-sentence shape, uniform sentence length, and "
+        "a meta-opener that nevertheless lacks abstract-noun chains / nominalised outcomes / "
+        "abstract triplets will usually clear. A noisy, informal paragraph that carries the cluster "
+        "will usually flag. Always check for S4b before assigning HIGH. "
+        "(Shawn BP2: four fully-scaffolded paragraphs — Introduction, Proposed Solution at 468w, "
+        "Executive Summary, Conclusion — all cleared because S4b was absent and grammatical noise "
+        "was present. Pre-submission prediction had them all HIGH; Turnitin cleared all four.)\n"
         "- **Sub-sectioned paragraph → lower severity.** If a paragraph splits into ≥3 bolded or "
         "numbered sub-labels (Stage 1, Stage 2, Phase A…) each followed by **bullet fragments**, "
         "treat the scaffold as broken — fragments under labels carry no S2/S3 load. "
         "(Dataset H §6.1 Patient Journey: predicted MEDIUM, Turnitin cleared it.)\n"
         "- **Phased-prose section → MEDIUM floor.** The inverse: ≥3 phase/risk/stage enumerators each "
         "followed by **full prose paragraphs** (not fragments). Floor severity at MEDIUM regardless "
-        "of per-paragraph S6 absence — per-phase prose carries S2 rhythm and S4 vocab even when "
+        "of per-paragraph S6 absence — per-phase prose carries S2 rhythm and S4b vocab even when "
         "surface openers look clean, and Turnitin scores the document-level enumeration scaffold. "
         "(G9 AI1 Operational Plan and Risk Analysis: predicted LOW, Turnitin flagged heavily, "
         "−13pt overall gap.)\n"
         "- **Meta-opener does not absorb body risk.** When a meta-opener sits at the top of a "
-        "paragraph that continues into a substantive scaffolded body, score the **opener and the "
+        "paragraph that continues into a substantive S4b-heavy body, score the **opener and the "
         "body as independent risks**. Turnitin often flags the substantive body regardless of what "
         "came before. (Dataset H ¶3 T&CM regulatory: the meta-opener was blamed; Turnitin actually "
         "flagged the substantive body that followed.)\n\n"
+        "- **S4b-dense list override for S1.** Bulleted fragments normally clear (S1 protection). "
+        "But a list of 10+ items each carrying nominalised outcomes or abstract triplets will flag "
+        "despite bullet format. (Shawn BP2 Risk Mitigation list: ~15 items flagged.)\n\n"
         "### Writing style for analysis text\n\n"
         "Write all analysis in plain, direct English. Avoid jargon. Follow these rules:\n"
         "- Say **what the problem is** in one plain sentence, then **why it matters** in one sentence.\n"
@@ -377,15 +554,17 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "The HTML structure should be:\n"
         "1. `<h1>` title + print button + `.subtitle` with document name and counts\n"
         "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
-        "assessment (all 8 signals). "
+        "assessment (all 8 signals, with v0.4 S4b-gated severity rules above). "
         "Formula: sum(word_count × severity_weight) / total_qualifying_words × 100, "
-        "where HIGH=0.90, MEDIUM=0.65, LOW=0.20, CLEAR=0.0. "
+        "where **HIGH=0.70, MEDIUM=0.40, LOW=0.12, CLEAR=0.0**. These weights are recalibrated "
+        "from v0.3 (which were 0.90/0.65/0.20) after the Shawn BP2 over-prediction "
+        "(76% predicted vs 20% actual, −56pt miss). "
         "**Exclude from the denominator:** cover page, Turnitin boilerplate/disclaimer text, "
         "any paragraph under ~50 words that reads as document furniture rather than substantive prose. "
         "These would be filtered as non-qualifying by Turnitin's own pipeline. "
         "Show the result as a large percentage with a coloured border "
-        "(red ≥60%, amber 30–59%, green <30%) and a subtitle: "
-        "'Full 8-signal estimate · ±10 pts vs Turnitin'. "
+        "(red ≥50%, amber 25–49%, green <25%) and a subtitle: "
+        "'v0.4 8-signal estimate (S4b-gated) · ±15 pts vs Turnitin'. "
         "Below it show a thin progress bar in the same colour at that percentage width.\n"
         "3. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
         "3. Summary table (`.summary-table`) with columns: ¶ · Severity · Signals · One-line note\n"
@@ -411,7 +590,7 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
     for i, (para, result) in enumerate(zip(paragraphs, results), 1):
         flags = result["flags"]
         metrics = result["metrics"]
-        sev = severity(flags)
+        sev = severity(flags, metrics)
 
         if flags:
             flagged_count += 1
@@ -423,10 +602,17 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         metric_str = (
             f"sent_stdev:{stdev_str} · "
             f"hedges:{metrics['hedge_pct']} · "
-            f"ttr:{metrics['ttr']}"
+            f"ttr:{metrics['ttr']} · "
+            f"s4b[chain:{metrics['s4b_chain']} nom:{metrics['s4b_nominal']} "
+            f"trip:{metrics['s4b_triplet']} total:{metrics['s4b_total']}] · "
+            f"noise:{metrics['noise_hits']}"
         )
         if metrics.get("formulaic_opener"):
             metric_str += " · FORMULAIC_OPENER"
+        if metrics.get("noisy"):
+            metric_str += " · GRAMMATICAL_NOISE"
+        if metrics.get("s4b_total", 0) >= 2:
+            metric_str += " · S4B_POSITIVE"
 
         lines.append(f"### ¶{i} · Severity: {sev} · Ruler flags: [{flag_str}]\n")
         lines.append(f"*Ruler metrics: {metric_str}*\n\n")
@@ -517,7 +703,7 @@ def build_rewrite_packet(
     lines.append("## Instructions for Claude\n\n")
     lines.append(
         "You are a Turnitin AI-detection expert trained on a live research playbook "
-        "covering 8 corpora, 12 reports, and ~450 flagged segments from IMU BCP2485 proposals.\n\n"
+        "covering 8 corpora, 13 reports, and ~476 flagged segments from IMU BCP2485 proposals.\n\n"
         "This packet contains a document that has **already been scored by Turnitin**. "
         "Each paragraph is labelled [FLAGGED] or [CLEAR] based on whether Turnitin's AI "
         "detector cyan-highlighted any of its text. Your task is **targeted rewriting** — "
@@ -525,23 +711,31 @@ def build_rewrite_packet(
         "truth is known; produce the fixes.\n\n"
         "### Your task\n\n"
         "For each [FLAGGED] paragraph:\n"
-        "1. Identify which of the 8 signals (S1–S8) are active, quoting the exact words "
-        "or phrases that trigger each signal\n"
-        "2. Produce a concrete **before/after rewrite** applying the appropriate T1–T9 techniques\n"
-        "3. Explain in one sentence what the rewrite changes and why it removes the signal\n\n"
+        "1. Identify which of the 8 signals (S1–S8, with S4 split into S4a/S4b) are active, "
+        "quoting the exact words or phrases that trigger each signal\n"
+        "2. **Diagnose S4b first.** The consulting-register cluster (abstract-noun chains, "
+        "nominalised outcomes, abstract-noun triplets) is the load-bearing signal. If it is "
+        "present, T5b (cluster removal) is mandatory and highest-priority.\n"
+        "3. Produce a concrete **before/after rewrite** applying the appropriate T1–T8 techniques\n"
+        "4. Explain in one sentence what the rewrite changes and why it removes the signal\n\n"
         "For [CLEAR] paragraphs: do NOT rewrite. Include them as a single row in the summary "
         "table only — no detail block.\n\n"
         "### Calibration patterns to watch for\n\n"
-        "Three patterns have been validated against Turnitin post-hoc — apply them when "
+        "Four patterns have been validated against Turnitin post-hoc — apply them when "
         "choosing techniques for flagged paragraphs:\n\n"
+        "- **S4b is the fingerprint.** When S4b is present → T5b (strip the cluster) is the "
+        "highest-leverage fix; T2/T3/T6 are amplifiers. When S4b is absent but the paragraph "
+        "is still flagged → the flag comes from document-wide signature (S7), list-density "
+        "overflow (S1 override with 10+ cluster-carrying bullets), or residual S4a/S5 vocab. "
+        "Do not reach for T5b in that case; it has nothing to strip.\n"
         "- **Sub-sectioned paragraph** (≥3 bolded or numbered sub-labels, each with bullet "
-        "fragments under it): scaffold is already broken — don't apply T3. Look for S4/S5/S6 instead.\n"
+        "fragments under it): scaffold is already broken — don't apply T3. Look for S4a/S4b/S5 instead.\n"
         "- **Phased-prose section** (≥3 phase/risk/stage enumerators, each followed by full "
-        "prose paragraphs): apply T1 (convert each phase to a table row) + T3 (break the "
-        "per-phase scaffold). Under-weighted by surface inspection — Turnitin scores the "
-        "document-level enumeration even when per-paragraph openers look clean.\n"
+        "prose paragraphs): apply T1 (convert each phase to a table row) + T5b (strip the "
+        "cluster). Under-weighted by surface inspection — Turnitin scores the document-level "
+        "enumeration even when per-paragraph openers look clean.\n"
         "- **Meta-opener + substantive body**: rewrite BOTH independently. The opener is not "
-        "the whole risk — Turnitin often flags the substantive body on its own S2/S3/S4 "
+        "the whole risk — Turnitin often flags the substantive body on its own S2/S4b "
         "pattern regardless of what came before it.\n\n"
         "### Writing style for rewrites and analysis text\n\n"
         "Plain, direct English. Avoid jargon. Follow these rules:\n"
@@ -718,7 +912,7 @@ def main():
     output_path.write_text(packet, encoding="utf-8")
 
     flagged = sum(1 for r in results if r["flags"])
-    high    = sum(1 for r in results if severity(r["flags"]) == "HIGH")
+    high    = sum(1 for r in results if severity(r["flags"], r["metrics"]) == "HIGH")
 
     print(f"\nResults:")
     print(f"  Total paragraphs : {len(paragraphs)}")
