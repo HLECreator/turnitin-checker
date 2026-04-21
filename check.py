@@ -53,6 +53,23 @@ FORMULAIC_OPENERS = [
     r"^the following (section|discussion|analysis|overview)",
 ]
 
+# S3 partial — synthesis closer: last sentence wraps up with a meta-conclusion
+SYNTHESIS_CLOSER = re.compile(
+    r"\b(in conclusion|in summary|overall|therefore|thus|as a result|"
+    r"this (shows|demonstrates|highlights|suggests|indicates|underscores|"
+    r"reveals|allows|ensures|means|reflects|reinforces)|"
+    r"this is (why|evident|crucial|important|essential)|"
+    r"these (results|findings|factors|aspects|elements) (show|suggest|highlight|demonstrate))"
+    r"[,\s]",
+    re.IGNORECASE,
+)
+
+# S5 — rule-of-three triplet: "X, Y and Z" or "X, Y, and Z"
+TRIPLET = re.compile(
+    r"\b[\w][\w\s\-]{1,30},\s+[\w][\w\s\-]{1,30},?\s+and\s+[\w][\w\s\-]{1,30}\b",
+    re.IGNORECASE,
+)
+
 
 # ── file readers ─────────────────────────────────────────────────────────────
 
@@ -170,6 +187,20 @@ def ruler_pass(paragraph: str) -> dict:
     if ttr < TTR_FLAG_BELOW:
         flags.append("S8")
 
+    # S3 partial — synthesis closer in last sentence
+    last_sentence = sentences[-1] if sentences else paragraph
+    if SYNTHESIS_CLOSER.search(last_sentence):
+        flags.append("S3")
+        metrics["synthesis_closer"] = True
+    else:
+        metrics["synthesis_closer"] = False
+
+    # S5 — rule-of-three triplet density (flag if 2+ triplets in paragraph)
+    triplet_count = len(TRIPLET.findall(paragraph))
+    metrics["triplets"] = triplet_count
+    if triplet_count >= 2:
+        flags.append("S5")
+
     return {"flags": flags, "metrics": metrics}
 
 
@@ -197,14 +228,22 @@ def estimate_ai_score(paragraphs: list, results: list) -> int:
     """
     Word-weighted AI score estimate. Mirrors Turnitin's logic:
     flagged words / total qualifying words.
-    Severity weights derived from corpus calibration (ruler pass over-flags ~10-15%,
-    so HIGH/MEDIUM weights are conservative rather than 1.0).
+
+    Calibration notes (v0.2):
+    - Weights recalibrated upward from G9 anchor: ruler estimated 48.6% vs Turnitin 62%
+      (correction factor 1.28). Turnitin is binary per-sentence, so MEDIUM paragraphs
+      contribute more than a 65% grade implies.
+    - Paragraphs under 50 words are excluded from the denominator — cover-page metadata
+      and short furniture blocks that Turnitin's qualifying-text filter would also drop.
     """
-    SEV_WEIGHT = {"HIGH": 0.88, "MEDIUM": 0.60, "LOW": 0.20, "CLEAR": 0.0}
+    SEV_WEIGHT    = {"HIGH": 0.95, "MEDIUM": 0.75, "LOW": 0.25, "CLEAR": 0.0}
+    MIN_SCORE_WDS = 50  # below this, paragraph is furniture — skip from denominator
     total_words   = 0
     flagged_words = 0.0
     for para, result in zip(paragraphs, results):
         wc = len(para.split())
+        if wc < MIN_SCORE_WDS:
+            continue  # exclude furniture from denominator
         total_words   += wc
         flagged_words += wc * SEV_WEIGHT[severity(result["flags"])]
     if total_words == 0:
@@ -299,9 +338,14 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "The HTML structure should be:\n"
         "1. `<h1>` title + `.subtitle` with document name and counts\n"
         "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
-        "assessment (all 8 signals). Formula: sum(word_count × severity_weight) / total_words × 100, "
-        "where HIGH=0.90, MEDIUM=0.65, LOW=0.20, CLEAR=0.0. Show the result as a large percentage "
-        "with a coloured border (red ≥60%, amber 30–59%, green <30%) and a subtitle: "
+        "assessment (all 8 signals). "
+        "Formula: sum(word_count × severity_weight) / total_qualifying_words × 100, "
+        "where HIGH=0.95, MEDIUM=0.75, LOW=0.25, CLEAR=0.0. "
+        "**Exclude from the denominator:** cover page, Turnitin boilerplate/disclaimer text, "
+        "any paragraph under ~50 words that reads as document furniture rather than substantive prose. "
+        "These would be filtered as non-qualifying by Turnitin's own pipeline. "
+        "Show the result as a large percentage with a coloured border "
+        "(red ≥60%, amber 30–59%, green <30%) and a subtitle: "
         "'Full 8-signal estimate · ±10 pts vs Turnitin'. "
         "Below it show a thin progress bar in the same colour at that percentage width.\n"
         "3. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
