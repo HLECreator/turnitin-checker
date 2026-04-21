@@ -1,6 +1,6 @@
 # Signal & Technique Reference — Turnitin AI Detector Playbook
 
-Derived from 7 corpora · 11 reports · ~79,400 words · 445 flagged segments (BCP2485, IMU).
+Derived from 8 corpora · 12 reports · ~97,500 words · ~450 flagged segments (BCP2485, IMU).
 
 ---
 
@@ -14,6 +14,10 @@ Tight clustering of sentence lengths in the 15–30 word band across 3+ consecut
 
 ### S3 · Scaffolded paragraph shape [High weight]
 The canonical AI paragraph: **topic sentence → 1–2 supporting sentences → concluding/transition sentence**. This 4-sentence scaffold appears in ~70% of flagged paragraphs. Where the scaffold is broken — paragraphs that open mid-thought, close on a factual fragment, or split at uneven points — flags drop. Reshaping only the topic sentence (declarative → subordinate-clause opener) can flip the whole paragraph.
+
+**Sub-sectioned exception — scaffold-broken.** A paragraph that splits into ≥3 bolded or numbered sub-labels (Stage 1, Stage 2, Phase A, Step 1…) each followed by **bullet fragments** counts as scaffold-broken. The sub-labels replace the canonical topic → support → synthesis shape per stage, and fragment content under each carries no S2 rhythm. Confirmed Dataset H §6.1 Patient Journey — rated MEDIUM on prediction, cleared entirely by Turnitin.
+
+**Phased-prose floor — MEDIUM minimum.** The inverse pattern: ≥3 phase/risk/stage enumerators ("Phase 1… Phase 2… Phase 3…", "Risk A… Risk B… Risk C…") each followed by **full prose paragraphs** rather than fragments. Floor severity at MEDIUM regardless of per-paragraph S6 absence. Per-phase prose carries S2 uniform rhythm + S4 vocabulary even when surface openers are clean, and the document-level enumeration scaffold itself is what Turnitin scores. Confirmed G9 AI1 Operational Plan and Risk Analysis — rated LOW on prediction, heavily flagged by Turnitin; under-prediction drove a −13pt gap in the overall score estimate.
 
 ### S4 · Low-perplexity vocabulary clusters [Medium weight]
 Words and phrases LLMs reach for reflexively: *utilise, leverage, comprehensive, holistic, seamless, robust, facilitate, implement, underscore, pivotal, stakeholders, ecosystem, streamline, enhance, foster, synergy, framework, paradigm*. Individual substitutions rarely flip a flagged passage alone, but consistent replacement compounds with structural changes.
@@ -29,6 +33,8 @@ Sentences that describe what the document is doing rather than saying something 
 - "The following discussion outlines…"
 
 These reliably flag. **Critical rule: meta-commentary must be cut, not paraphrased.** Rephrasing a meta-sentence keeps it flagged (confirmed G8, G7 datasets). If the heading already signals the section's content, the meta-sentence is redundant.
+
+**Attribution note — opener does not absorb body risk.** When a meta-opener sits at the top of a paragraph that continues into a substantive scaffolded body, score the opener and the body as **independent** flag risks. Turnitin frequently flags the substantive paragraph on its own S2/S3/S4 pattern regardless of what came before; do not assume the meta-sentence absorbs all the weight. Confirmed Dataset H ¶3 T&CM regulatory: the meta-opener "This business plan details…" was blamed as the trigger, but Turnitin actually highlighted the substantive T&CM regulatory body that followed.
 
 ### S7 · Document-wide phrase recurrence [Low weight, cumulative]
 Each individual repetition is benign. Document-wide consistency of recurring phrases compounds across scoring — the detector weights whole-document signature as well as per-segment. Single-author documents are more vulnerable than multi-author documents, where natural voice variation dilutes the signature.

@@ -227,5 +227,5 @@ st.divider()
 st.caption(
     "Ruler pass covers S2, S3 (partial), S4, S5, S6, S8. "
     "Claude identifies all 8 signals and writes the rewrite suggestions. "
-    "Corpus: 7 datasets · 11 reports · 445 flagged segments (IMU BCP2485)."
+    "Corpus: 8 datasets · 12 reports · ~450 flagged segments (IMU BCP2485)."
 )
