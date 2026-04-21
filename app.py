@@ -174,8 +174,58 @@ st.markdown(
 )
 
 st.divider()
+st.subheader("What do these metrics mean?")
+
+with st.expander("Sent stdev — Sentence length variation"):
+    st.markdown(
+        "**What it measures:** How much the word count varies between sentences in a paragraph.\n\n"
+        "**Why it matters:** Human writers naturally mix short punchy sentences with longer ones. "
+        "AI-generated text tends to cluster every sentence in the 15–30 word range, producing a "
+        "flat, uniform rhythm. A low stdev (below 8) means most sentences are nearly the same "
+        "length — a strong AI signal.\n\n"
+        "**How to fix it:** Add at least one sentence under 10 words and one over 25 words per paragraph. "
+        "The simplest method: split one long sentence into two short fragments."
+    )
+
+with st.expander("Hedges — Hedge word density"):
+    st.markdown(
+        "**What it measures:** The fraction of words in a paragraph that are AI-favoured "
+        "connectives and filler vocabulary — words like *moreover, furthermore, utilise, "
+        "leverage, comprehensive, holistic, seamless, robust, facilitate, implement*.\n\n"
+        "**Why it matters:** These words appear reflexively in AI output because they are "
+        "common in formal training data. A density above 6% signals a paragraph saturated "
+        "with low-surprise vocabulary.\n\n"
+        "**How to fix it:** Swap AI-favoured words for plainer alternatives — "
+        "\"utilise\" → \"use\", \"facilitate\" → \"help\", \"comprehensive\" → \"full\"."
+    )
+
+with st.expander("Vocab TTR — Vocabulary type-token ratio"):
+    st.markdown(
+        "**What it measures:** The proportion of *unique* words out of all words in a paragraph. "
+        "A TTR of 0.60 means 60% of words are distinct; the other 40% are repeats.\n\n"
+        "**Why it matters:** AI text often repeats the same nouns, verbs, and phrases within a "
+        "short passage, reducing vocabulary diversity. A TTR below 0.55 suggests the paragraph "
+        "is leaning on a narrow word set — a low-perplexity signature that detectors pick up.\n\n"
+        "**How to fix it:** Vary the nouns and verbs across sentences rather than restating "
+        "the same concept in the same words."
+    )
+
+with st.expander("Form. opener — Formulaic opener"):
+    st.markdown(
+        "**What it measures:** Whether the paragraph's first sentence matches a known AI-style "
+        "opening pattern — phrases like *\"In today's world…\"*, *\"This section analyses…\"*, "
+        "*\"It is important to note…\"*, *\"By leveraging…\"*, *\"To ensure…\"*.\n\n"
+        "**Why it matters:** These openers are meta-commentary — they describe what the document "
+        "is doing rather than saying something substantive. Turnitin's detector consistently "
+        "flags paragraphs that open this way. Paraphrasing does not help; the sentence must be "
+        "cut entirely or replaced with a concrete claim.\n\n"
+        "**How to fix it:** Delete the opener and let the heading carry the signposting. "
+        "Start the paragraph mid-argument instead."
+    )
+
+st.divider()
 st.caption(
-    "Ruler pass covers S2, S4, S6, S8. "
-    "Claude identifies S1, S3, S5, S7 and writes the rewrite suggestions. "
+    "Ruler pass covers S2, S3 (partial), S4, S5, S6, S8. "
+    "Claude identifies all 8 signals and writes the rewrite suggestions. "
     "Corpus: 7 datasets · 11 reports · 445 flagged segments (IMU BCP2485)."
 )
