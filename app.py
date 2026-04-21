@@ -80,15 +80,16 @@ with st.spinner("Reading document…"):
     #   2. Merged heading+text: paragraph that *starts* with "References:" or "References\n"
     #   3. Numbered citation block: paragraph that starts with "1." or "[1]" citation format
     HEADING_ALONE = re.compile(
-        r'^(references|bibliography|works cited|reference list):?\s*$',
+        r'^(\d+[.):]?\s+)?(references|bibliography|works cited|reference list):?\s*$',
         re.IGNORECASE,
     )
     HEADING_MERGED = re.compile(
-        r'^(references|bibliography|works cited|reference list)[:\s]',
+        r'^(\d+[.):]?\s+)?(references|bibliography|works cited|reference list)[:\s]',
         re.IGNORECASE,
     )
+    # Bracket format only — "1." also matches section headings like "2. Executive Summary"
     CITATION_BLOCK = re.compile(
-        r'^(\[\d+\]|\d+[.):])\s+\w',  # starts with [1], "1. Word", "1) Word", or "1: Word"
+        r'^\[\d+\]\s+\w',
     )
     cutoff = len(all_paras)
     for idx, p in enumerate(all_paras):
