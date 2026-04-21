@@ -54,14 +54,30 @@ with st.spinner("Reading document…"):
     raw_paras = re.split(r'\n{2,}', text)
     all_paras = [p.strip() for p in raw_paras if p.strip()]
 
-    # Drop everything from the references/bibliography heading onward
-    REFERENCES_PATTERN = re.compile(
-        r'^(references|bibliography|works cited|reference list)\s*$',
+    # Drop everything from the references/bibliography section onward.
+    # Handles three cases:
+    #   1. Standalone heading:  "References" or "References:" alone on a line
+    #   2. Merged heading+text: paragraph that *starts* with "References:" or "References\n"
+    #   3. Numbered citation block: paragraph that starts with "1." or "[1]" citation format
+    HEADING_ALONE = re.compile(
+        r'^(references|bibliography|works cited|reference list):?\s*$',
         re.IGNORECASE,
+    )
+    HEADING_MERGED = re.compile(
+        r'^(references|bibliography|works cited|reference list)[:\s]',
+        re.IGNORECASE,
+    )
+    CITATION_BLOCK = re.compile(
+        r'^(\[\d+\]|\d+[.):])\s+\w',  # starts with [1], "1. Word", "1) Word", or "1: Word"
     )
     cutoff = len(all_paras)
     for idx, p in enumerate(all_paras):
-        if REFERENCES_PATTERN.match(p.strip()):
+        first_line = p.split('\n')[0].strip()
+        if (
+            HEADING_ALONE.match(p.strip())
+            or HEADING_MERGED.match(p.strip())
+            or CITATION_BLOCK.match(first_line)
+        ):
             cutoff = idx
             break
 
