@@ -193,6 +193,25 @@ def severity(flags: list) -> str:
     return "HIGH"
 
 
+def estimate_ai_score(paragraphs: list, results: list) -> int:
+    """
+    Word-weighted AI score estimate. Mirrors Turnitin's logic:
+    flagged words / total qualifying words.
+    Severity weights derived from corpus calibration (ruler pass over-flags ~10-15%,
+    so HIGH/MEDIUM weights are conservative rather than 1.0).
+    """
+    SEV_WEIGHT = {"HIGH": 0.88, "MEDIUM": 0.60, "LOW": 0.20, "CLEAR": 0.0}
+    total_words   = 0
+    flagged_words = 0.0
+    for para, result in zip(paragraphs, results):
+        wc = len(para.split())
+        total_words   += wc
+        flagged_words += wc * SEV_WEIGHT[severity(result["flags"])]
+    if total_words == 0:
+        return 0
+    return round(flagged_words / total_words * 100)
+
+
 def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref: str, doc_name: str) -> str:
     lines = []
 
@@ -279,7 +298,13 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "```\n\n"
         "The HTML structure should be:\n"
         "1. `<h1>` title + `.subtitle` with document name and counts\n"
-        "2. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
+        "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
+        "assessment (all 8 signals). Formula: sum(word_count × severity_weight) / total_words × 100, "
+        "where HIGH=0.90, MEDIUM=0.65, LOW=0.20, CLEAR=0.0. Show the result as a large percentage "
+        "with a coloured border (red ≥60%, amber 30–59%, green <30%) and a subtitle: "
+        "'Full 8-signal estimate · ±10 pts vs Turnitin'. "
+        "Below it show a thin progress bar in the same colour at that percentage width.\n"
+        "3. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
         "3. Summary table (`.summary-table`) with columns: ¶ · Severity · Signals · One-line note\n"
         "4. Each paragraph as a `.para-block` with appropriate severity class. Inside: `.para-header` "
         "(containing `.para-num`, `.sev-badge`, `.signal-chips`), `.para-text`, `.analysis` note, "

@@ -103,16 +103,17 @@ n_low    = sevs.count("LOW")
 n_flagged = sum(1 for r in results if r["flags"])
 
 st.subheader("Ruler-pass summary")
+
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Paragraphs",    len(paragraphs))
-c2.metric("🔴 HIGH",       n_high)
-c3.metric("🟡 MEDIUM",     n_medium)
-c4.metric("⚪ LOW",        n_low)
+c1.metric("Paragraphs", len(paragraphs))
+c2.metric("🔴 HIGH",    n_high)
+c3.metric("🟡 MEDIUM",  n_medium)
+c4.metric("⚪ LOW",     n_low)
 
 st.caption(
-    f"{n_flagged} of {len(paragraphs)} paragraphs tripped at least one measurable signal "
-    f"({n_flagged/len(paragraphs):.0%}). "
-    "Signals S1, S3, S5, and S7 require reading judgment — Claude catches those in the next step."
+    f"{n_flagged} of {len(paragraphs)} paragraphs tripped at least one measurable signal. "
+    "An estimated AI% is included in the HTML report Claude generates — "
+    "it uses all 8 signals and is much closer to Turnitin's actual score."
 )
 
 # ── paragraph breakdown ───────────────────────────────────────────────────────
