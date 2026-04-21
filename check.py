@@ -229,12 +229,13 @@ def estimate_ai_score(paragraphs: list, results: list) -> int:
     Word-weighted AI score estimate. Mirrors Turnitin's logic:
     flagged words / total qualifying words.
 
-    Calibration notes (v0.2):
-    - Weights recalibrated upward from G9 anchor: ruler estimated 48.6% vs Turnitin 62%
-      (correction factor 1.28). Turnitin is binary per-sentence, so MEDIUM paragraphs
-      contribute more than a 65% grade implies.
-    - Paragraphs under 50 words are excluded from the denominator — cover-page metadata
-      and short furniture blocks that Turnitin's qualifying-text filter would also drop.
+    Calibration notes (v0.3):
+    - These are RULER-ONLY weights (Streamlit preview). They are intentionally higher than
+      the packet weights Claude uses, because the ruler misses S1/S3(full)/S7 and needs
+      compensation. Two-point corpus calibration: G9 ruler→54% vs Turnitin 62%.
+    - Claude's HTML report uses separate weights (HIGH=0.90, MEDIUM=0.65, LOW=0.20)
+      calibrated on a rewritten proposal: Claude→36% vs Turnitin 33% (delta 3 pts).
+    - Paragraphs under 50 words excluded from denominator (document furniture).
     """
     SEV_WEIGHT    = {"HIGH": 0.95, "MEDIUM": 0.75, "LOW": 0.25, "CLEAR": 0.0}
     MIN_SCORE_WDS = 50  # below this, paragraph is furniture — skip from denominator
@@ -355,7 +356,7 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
         "assessment (all 8 signals). "
         "Formula: sum(word_count × severity_weight) / total_qualifying_words × 100, "
-        "where HIGH=0.95, MEDIUM=0.75, LOW=0.25, CLEAR=0.0. "
+        "where HIGH=0.90, MEDIUM=0.65, LOW=0.20, CLEAR=0.0. "
         "**Exclude from the denominator:** cover page, Turnitin boilerplate/disclaimer text, "
         "any paragraph under ~50 words that reads as document furniture rather than substantive prose. "
         "These would be filtered as non-qualifying by Turnitin's own pipeline. "
