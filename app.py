@@ -4,8 +4,8 @@ import streamlit as st
 from pathlib import Path
 
 from check import (
-    read_docx, read_pdf, ruler_pass, build_packet,
-    load_file, severity, MIN_PARA_WORDS,
+    read_docx, read_pdf, ruler_pass, build_packet, build_rewrite_packet,
+    match_flagged_passages, load_file, severity, MIN_PARA_WORDS,
 )
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -22,13 +22,33 @@ st.caption(
     "drag it into Claude.ai (Opus) to get a flagged HTML report."
 )
 
-st.info(
-    "**How it works:** The tool runs a quick ruler pass on your document "
-    "(sentence length, hedge words, formulaic openers, vocabulary diversity), "
-    "then bundles everything — including the full signal reference and real "
-    "before/after examples — into a single file for Claude to analyse.",
-    icon="ℹ️",
+# ── mode selector ─────────────────────────────────────────────────────────────
+mode = st.radio(
+    "Mode",
+    ["Prediction mode (before Turnitin)", "Rewrite mode (after Turnitin)"],
+    horizontal=True,
+    captions=[
+        "Upload draft → predict AI score + rewrite suggestions",
+        "Upload draft + paste flagged passages → targeted rewrites",
+    ],
 )
+
+if mode.startswith("Prediction"):
+    st.info(
+        "**How it works:** The tool runs a quick ruler pass on your document "
+        "(sentence length, hedge words, formulaic openers, vocabulary diversity), "
+        "then bundles everything — including the full signal reference and real "
+        "before/after examples — into a single file for Claude to analyse.",
+        icon="ℹ️",
+    )
+else:
+    st.info(
+        "**How it works:** You already have a Turnitin AI report. Upload your draft, "
+        "paste the cyan-highlighted passages (one per blank-line-separated block), "
+        "and the tool matches each passage to a paragraph. The packet tells Claude "
+        "exactly which paragraphs to rewrite — no prediction, no guessing.",
+        icon="ℹ️",
+    )
 
 st.divider()
 
@@ -92,6 +112,115 @@ if not paragraphs:
     )
     st.stop()
 
+# ── mode branch ───────────────────────────────────────────────────────────────
+if mode.startswith("Rewrite"):
+    st.divider()
+    st.subheader("Paste Turnitin-flagged passages")
+    st.caption(
+        "Copy the cyan-highlighted text from your Turnitin AI report. "
+        "Separate distinct passages with a blank line. Fragments under 10 characters are skipped."
+    )
+    flagged_raw = st.text_area(
+        "Flagged passages",
+        height=240,
+        placeholder=(
+            "This section analyses the market relevant to the establishment of…\n\n"
+            "Despite the prevalent burden of musculoskeletal conditions…\n\n"
+            "In conclusion, this proposal offers a strategic response…"
+        ),
+        label_visibility="collapsed",
+    )
+
+    if not flagged_raw.strip():
+        st.info("Paste at least one flagged passage above to continue.")
+        st.stop()
+
+    flagged_passages = [p.strip() for p in re.split(r"\n{2,}", flagged_raw) if p.strip()]
+    flagged_map = match_flagged_passages(paragraphs, flagged_passages)
+
+    matched_para_idxs = {idx for idx in flagged_map if idx != -1}
+    unmatched = flagged_map.get(-1, [])
+
+    st.divider()
+    st.subheader("Match summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Paragraphs",       len(paragraphs))
+    c2.metric("🔴 Flagged",       len(matched_para_idxs))
+    c3.metric("🟢 Clear",         len(paragraphs) - len(matched_para_idxs))
+    c4.metric("⚠️ Unmatched",     len(unmatched))
+
+    st.caption(
+        f"{len(flagged_passages)} passage(s) submitted · "
+        f"{len(flagged_passages) - len(unmatched)} matched to a paragraph · "
+        f"{len(unmatched)} unmatched (included in packet as context)."
+    )
+
+    if unmatched:
+        with st.expander(f"⚠️ Review {len(unmatched)} unmatched passage(s)"):
+            for p in unmatched:
+                st.text(p[:400] + ("…" if len(p) > 400 else ""))
+            st.caption(
+                "Most common causes: text from tables/figures/captions (extracted differently "
+                "than prose), highlights split across page breaks, or OCR whitespace artefacts. "
+                "These still appear in the packet under 'Unmatched passages' — Claude uses them as context."
+            )
+
+    st.divider()
+    st.subheader("Paragraph breakdown")
+
+    for i, para in enumerate(paragraphs, 1):
+        passages = flagged_map.get(i - 1, [])
+        if passages:
+            label = f"🔴 ¶{i} · **FLAGGED** · {len(passages)} passage(s)"
+            expanded = True
+        else:
+            label = f"🟢 ¶{i} · Clear"
+            expanded = False
+        with st.expander(label, expanded=expanded):
+            if passages:
+                st.markdown("**Turnitin-highlighted:**")
+                for p in passages:
+                    st.info(p[:500] + ("…" if len(p) > 500 else ""), icon="🔴")
+                st.markdown("**Full paragraph:**")
+            preview = para[:600] + ("…" if len(para) > 600 else "")
+            st.text(preview)
+
+    # ── rewrite packet download ──────────────────────────────────────────────
+    st.divider()
+    st.subheader("Get your rewrites")
+
+    script_dir   = Path(__file__).parent
+    signals_ref  = load_file("signals.md",  script_dir)
+    fewshots_ref = load_file("fewshots.md", script_dir)
+    packet       = build_rewrite_packet(
+        paragraphs, flagged_map, signals_ref, fewshots_ref, uploaded.name
+    )
+
+    packet_name = f"{Path(uploaded.name).stem}_rewrite_packet.md"
+
+    st.download_button(
+        label="⬇️  Download rewrite packet",
+        data=packet.encode("utf-8"),
+        file_name=packet_name,
+        mime="text/markdown",
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.markdown(
+        """
+**Next steps:**
+1. Open [claude.ai](https://claude.ai) → start a new chat → switch the model to **Opus**
+2. Drag the downloaded packet file into the chat
+3. Send: *Rewrite the flagged paragraphs and return an HTML report as an artifact.*
+4. Download the HTML report from the artifact panel
+"""
+    )
+
+    st.stop()
+
+# ── prediction mode continues ─────────────────────────────────────────────────
 with st.spinner("Running ruler pass…"):
     results = [ruler_pass(p) for p in paragraphs]
 

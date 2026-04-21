@@ -437,6 +437,238 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
     return "".join(lines)
 
 
+# ── rewrite mode support ─────────────────────────────────────────────────────
+
+def normalise_for_match(text: str) -> str:
+    """Collapse whitespace and lowercase for substring/token matching."""
+    return re.sub(r"\s+", " ", text.lower().strip())
+
+
+def match_flagged_passages(paragraphs: list, flagged_passages: list) -> dict:
+    """
+    Map each Turnitin-flagged passage to the index of the paragraph that contains it.
+    Returns {paragraph_idx: [passages…]}; unmatched passages live under key -1.
+
+    Strategy:
+      1. Exact substring match on normalised (lowercased, whitespace-collapsed) text.
+      2. Fallback: token-overlap ≥ 70% of passage tokens present in paragraph.
+
+    Designed for Turnitin cyan highlights, which preserve the exact source text but
+    may contain OCR whitespace artefacts or cross paragraph boundaries.
+    """
+    match_map = {}
+    norm_paras = [normalise_for_match(p) for p in paragraphs]
+
+    for passage in flagged_passages:
+        norm_passage = normalise_for_match(passage)
+        if len(norm_passage) < 10:
+            continue  # trivial fragment — not worth matching
+
+        hit = None
+
+        # Pass 1: exact substring
+        for idx, norm_para in enumerate(norm_paras):
+            if norm_passage in norm_para:
+                hit = idx
+                break
+
+        # Pass 2: token-overlap fallback
+        if hit is None:
+            passage_tokens = set(re.findall(r"\b\w+\b", norm_passage))
+            if len(passage_tokens) >= 4:
+                best_idx, best_overlap = None, 0.0
+                for idx, norm_para in enumerate(norm_paras):
+                    para_tokens = set(re.findall(r"\b\w+\b", norm_para))
+                    overlap = len(passage_tokens & para_tokens) / len(passage_tokens)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_idx = idx
+                if best_overlap >= 0.70:
+                    hit = best_idx
+
+        key = hit if hit is not None else -1
+        match_map.setdefault(key, []).append(passage)
+
+    return match_map
+
+
+def build_rewrite_packet(
+    paragraphs: list,
+    flagged_map: dict,
+    signals_ref: str,
+    fewshots_ref: str,
+    doc_name: str,
+) -> str:
+    """
+    Build a rewrite-mode packet for Claude.
+
+    Each paragraph is labelled [FLAGGED] or [CLEAR] based on whether the user-supplied
+    Turnitin-highlighted passages matched it. Claude's task is targeted rewriting —
+    no severity prediction, no AI score calculation — because the ground truth is known.
+    """
+    lines = []
+    lines.append(f"# Turnitin AI Rewrite Packet — {doc_name}\n\n")
+
+    lines.append("## Instructions for Claude\n\n")
+    lines.append(
+        "You are a Turnitin AI-detection expert trained on a live research playbook "
+        "covering 8 corpora, 12 reports, and ~450 flagged segments from IMU BCP2485 proposals.\n\n"
+        "This packet contains a document that has **already been scored by Turnitin**. "
+        "Each paragraph is labelled [FLAGGED] or [CLEAR] based on whether Turnitin's AI "
+        "detector cyan-highlighted any of its text. Your task is **targeted rewriting** — "
+        "no prediction, no severity classification, no AI score calculation. The ground "
+        "truth is known; produce the fixes.\n\n"
+        "### Your task\n\n"
+        "For each [FLAGGED] paragraph:\n"
+        "1. Identify which of the 8 signals (S1–S8) are active, quoting the exact words "
+        "or phrases that trigger each signal\n"
+        "2. Produce a concrete **before/after rewrite** applying the appropriate T1–T9 techniques\n"
+        "3. Explain in one sentence what the rewrite changes and why it removes the signal\n\n"
+        "For [CLEAR] paragraphs: do NOT rewrite. Include them as a single row in the summary "
+        "table only — no detail block.\n\n"
+        "### Calibration patterns to watch for\n\n"
+        "Three patterns have been validated against Turnitin post-hoc — apply them when "
+        "choosing techniques for flagged paragraphs:\n\n"
+        "- **Sub-sectioned paragraph** (≥3 bolded or numbered sub-labels, each with bullet "
+        "fragments under it): scaffold is already broken — don't apply T3. Look for S4/S5/S6 instead.\n"
+        "- **Phased-prose section** (≥3 phase/risk/stage enumerators, each followed by full "
+        "prose paragraphs): apply T1 (convert each phase to a table row) + T3 (break the "
+        "per-phase scaffold). Under-weighted by surface inspection — Turnitin scores the "
+        "document-level enumeration even when per-paragraph openers look clean.\n"
+        "- **Meta-opener + substantive body**: rewrite BOTH independently. The opener is not "
+        "the whole risk — Turnitin often flags the substantive body on its own S2/S3/S4 "
+        "pattern regardless of what came before it.\n\n"
+        "### Writing style for analysis text\n\n"
+        "Plain, direct English. Avoid jargon. Follow these rules:\n"
+        "- Quote the exact word or phrase that triggers each signal\n"
+        "- Keep each analysis note under 3 sentences\n"
+        "- Show concrete rewrite examples, not just technique names\n"
+        "- Good: 'The opener \"This section analyses…\" is meta-commentary (S6). Cut it — "
+        "the heading already signposts.'\n"
+        "- Bad: 'S6 meta-commentary present; apply T6.'\n\n"
+        "### Output format\n\n"
+        "Return a **single self-contained HTML artifact**. Use this exact CSS in a `<style>` block:\n\n"
+        "```css\n"
+        "body { font-family: system-ui, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 24px; color: #222; }\n"
+        "h1 { font-size: 20px; margin-bottom: 4px; }\n"
+        ".subtitle { color: #666; font-size: 13px; margin-bottom: 32px; }\n"
+        ".summary-table { width: 100%; border-collapse: collapse; margin-bottom: 32px; font-size: 13px; }\n"
+        ".summary-table th { background: #f5f5f5; text-align: left; padding: 8px 12px; border-bottom: 2px solid #ddd; }\n"
+        ".summary-table td { padding: 7px 12px; border-bottom: 1px solid #eee; vertical-align: top; }\n"
+        ".para-block { border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px 18px; margin: 16px 0; }\n"
+        ".para-block.flagged { border-left: 4px solid #c0392b; }\n"
+        ".para-block.clear { border-left: 4px solid #1e8449; opacity: 0.6; }\n"
+        ".para-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }\n"
+        ".para-num { font-weight: 700; font-size: 13px; color: #555; min-width: 28px; }\n"
+        ".sev-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }\n"
+        ".sev-badge.flagged { background: #fde; color: #c0392b; }\n"
+        ".sev-badge.clear { background: #eafaf1; color: #1e8449; }\n"
+        ".signal-chips { display: flex; flex-wrap: wrap; gap: 4px; }\n"
+        ".chip { font-size: 11px; padding: 2px 7px; border-radius: 4px; border: 1px solid #c0392b; "
+        "background: #fef0f0; color: #c0392b; white-space: nowrap; }\n"
+        ".para-text { font-size: 13px; line-height: 1.6; color: #333; margin: 10px 0; white-space: pre-wrap; }\n"
+        ".analysis { font-size: 13px; color: #444; background: #fafafa; border-left: 3px solid #ddd; "
+        "padding: 8px 12px; margin: 8px 0; border-radius: 0 4px 4px 0; }\n"
+        ".rewrite-box { font-size: 13px; background: #f0f8f0; border-left: 3px solid #1e8449; "
+        "padding: 10px 14px; margin: 8px 0; border-radius: 0 4px 4px 0; }\n"
+        ".rewrite-box strong { display: block; margin-bottom: 4px; color: #1e8449; }\n"
+        ".legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: #555; "
+        "background: #f9f9f9; border: 1px solid #eee; border-radius: 6px; padding: 10px 14px; margin-bottom: 24px; }\n"
+        ".top-actions { background: #fffbf0; border: 1px solid #f0d080; border-radius: 8px; "
+        "padding: 16px 18px; margin-top: 32px; }\n"
+        ".top-actions h2 { font-size: 15px; margin: 0 0 10px; }\n"
+        ".top-actions ol { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.8; }\n"
+        ".print-btn { display: inline-block; margin: 16px 0 24px; padding: 8px 18px; "
+        "background: #2c3e50; color: #fff; border: none; border-radius: 6px; "
+        "font-size: 13px; cursor: pointer; }\n"
+        ".print-btn:hover { background: #1a252f; }\n"
+        "@media print {\n"
+        "  @page { margin: 15mm; size: A4 portrait; }\n"
+        "  html, body { width: 100%; max-width: 100%; margin: 0; padding: 0; "
+        "font-size: 10.5pt; color: #000; background: #fff; "
+        "-webkit-print-color-adjust: exact; print-color-adjust: exact; }\n"
+        "  .print-btn { display: none; }\n"
+        "  .para-block { break-inside: avoid; page-break-inside: avoid; "
+        "border: 1px solid #ccc !important; margin: 8px 0; padding: 8px 10px; "
+        "border-radius: 0 !important; box-shadow: none !important; }\n"
+        "  .para-block.clear { display: none; }\n"
+        "  .rewrite-box, .analysis { break-inside: avoid; page-break-inside: avoid; }\n"
+        "  .summary-table tr { break-inside: avoid; page-break-inside: avoid; }\n"
+        "  .top-actions, .legend { break-inside: avoid; page-break-inside: avoid; }\n"
+        "  h1, h2 { break-after: avoid; page-break-after: avoid; }\n"
+        "}\n"
+        "```\n\n"
+        "**Include this print button just below the `<h1>` title:**\n"
+        "```html\n"
+        "<button class=\"print-btn\" onclick=\"window.print()\">🖨️ Save as PDF</button>\n"
+        "```\n\n"
+        "The HTML structure:\n"
+        "1. `<h1>` title + print button + `.subtitle` showing the document name and "
+        "'X of Y paragraphs flagged by Turnitin'\n"
+        "2. Signal legend (`.legend`) listing which S1–S8 signals appear in this document, "
+        "with one `.chip` per signal\n"
+        "3. Summary table (`.summary-table`) with columns: ¶ · Status · Signals active · Techniques applied\n"
+        "4. For each [FLAGGED] paragraph, a `.para-block.flagged` containing:\n"
+        "   - `.para-header` with `.para-num`, `.sev-badge.flagged`, and `.signal-chips`\n"
+        "   - `.para-text` — the original paragraph\n"
+        "   - `.analysis` — bullet list of triggering signals with the exact quoted phrase from the text\n"
+        "   - `.rewrite-box` — the rewritten paragraph, preceded by a `<strong>` 'Rewrite:' label, "
+        "     followed by a one-sentence rationale\n"
+        "5. For [CLEAR] paragraphs: one row in the summary table, no detail block\n"
+        "6. `.top-actions` with a numbered list of the 3 highest-leverage edits for this document "
+        "(e.g. 'Cut all N meta-openers — accounts for Z% of flagged paragraphs')\n\n"
+        "**Do NOT compute an AI score** — Turnitin has already provided it. Focus exclusively on fixes.\n\n"
+        "---\n\n"
+    )
+
+    lines.append("## Signal & Technique Reference\n\n")
+    lines.append(signals_ref)
+    lines.append("\n\n---\n\n")
+
+    lines.append("## Before/After Examples\n\n")
+    lines.append(fewshots_ref)
+    lines.append("\n\n---\n\n")
+
+    lines.append("## Document Under Review — Turnitin-Scored\n\n")
+
+    matched_para_idxs = {idx for idx in flagged_map if idx != -1}
+    unmatched = flagged_map.get(-1, [])
+
+    for i, para in enumerate(paragraphs):
+        passages = flagged_map.get(i, [])
+        status = "FLAGGED" if passages else "CLEAR"
+        lines.append(f"### ¶{i+1} · Status: {status}\n")
+        if passages:
+            lines.append(f"*Turnitin flagged {len(passages)} passage(s) in this paragraph:*\n\n")
+            for p in passages:
+                quoted = p.strip().replace("\n", " ")
+                if len(quoted) > 400:
+                    quoted = quoted[:400] + "…"
+                lines.append(f"> {quoted}\n\n")
+        lines.append(f"{para}\n\n")
+
+    lines.append("---\n\n")
+    lines.append(
+        f"*Turnitin summary: **{len(matched_para_idxs)}/{len(paragraphs)}** paragraphs contain "
+        f"at least one cyan-highlighted passage. Rewrite those; leave CLEAR paragraphs alone.*\n"
+    )
+
+    if unmatched:
+        lines.append("\n## Unmatched passages\n\n")
+        lines.append(
+            f"*{len(unmatched)} flagged passage(s) could not be matched to any paragraph in the "
+            f"source document. Likely origins: tables, figures, captions, headings, or text that "
+            f"crosses paragraph boundaries. Use them as additional rewrite context:*\n\n"
+        )
+        for p in unmatched:
+            quoted = p.strip().replace("\n", " ")
+            if len(quoted) > 400:
+                quoted = quoted[:400] + "…"
+            lines.append(f"> {quoted}\n\n")
+
+    return "".join(lines)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
