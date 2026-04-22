@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Turnitin AI Checker — v0.5
+Turnitin AI Checker — v0.6
 Run: python check.py <document.docx|document.pdf>
 Output: <docname>_packet.md — drag into Claude.ai (Opus) for a flagged HTML report.
 
+v0.6 — Register-expansion + section/document floors (22 Apr 2026):
+- Formula: AI_para = min(S_struct × P_polish × first_person_factor × R_register, 1.0)
+- R_register (NEW): keyword-bucket detector for market/public-health/clinical-literature
+  prose. Replaces the v0.5 telehealth-only manual +0.10 rule.
+- Section-level floor (NEW, post-processing): contiguous runs of ≥3 paragraphs where
+  ≥60% score MEDIUM+ have remaining paragraphs floored at LOW (ai_para ≥ 0.10).
+- Polish-aware CLEAR downgrade (NEW, document-level): when doc clean_ratio ≥ 0.70,
+  every paragraph is floored at LOW. Polished documents get no CLEAR outputs.
+- Driven by two fresh v0.5 misses: G8 AI2 pre-submission (52% vs 69%, Δ −17) and
+  G9 AI1 pre-submission (28% vs 62%, Δ −34, largest v0.5 miss).
+- Expected v0.6 recalibration: G8 52% → ~63%, G9 28% → ~50%.
+
 v0.5 — Continuous per-paragraph scoring (22 Apr 2026, 8 corpora, 13 reports, ~103,150 words):
-- Replaces v0.4 four-band categorical output (CLEAR/LOW/MEDIUM/HIGH + S4b hard gate)
-- Formula: AI_para = S_struct × P_polish × first_person_factor, bounded [0, 1]
+- Replaced v0.4 four-band categorical output (CLEAR/LOW/MEDIUM/HIGH + S4b hard gate)
 - S_struct: additive per-signal weights (see compute_s_struct()); no S4b gating required for HIGH
 - P_polish: multiplicative noise moderator (1.0 clean → 0.5 recurring noise)
 - first_person_factor: voice-register moderator (0.8 sustained first/second-person, 0.9 contractions)
 - Document score: word-weighted average of AI_para across all qualifying paragraphs (≥20 words)
-- Removes v0.3/v0.4 fixed 7-paragraph ceiling — full document coverage
-- Calibration: Huewrite R3 ~20% vs <20% actual; G8 AI2 ~65% vs 69%; G7 AI1 ~45% vs 47%
-- Open issue (v0.6 target): S4b-gating too strict on telehealth/mHealth scaffolded prose
+- Removed v0.3/v0.4 fixed 7-paragraph ceiling — full document coverage
+- Calibration: Huewrite R3 ~20% vs <20%; G8 AI2 overlap ~65% vs 69%; G7 AI1 ~45% vs 47%
 """
 
 import sys
@@ -136,6 +146,22 @@ TRIPLET = re.compile(
     r"\b[\w][\w\s\-]{1,30},\s+[\w][\w\s\-]{1,30},?\s+and\s+[\w][\w\s\-]{1,30}\b",
     re.IGNORECASE,
 )
+
+# v0.6 — R_register keyword buckets.
+# Replaces the v0.5 telehealth-only manual +0.10 rule. Turnitin flags register-consistent
+# prose (market/business, public-health, clinical-literature) more aggressively than the
+# S4b pattern regex catches. Each matched keyword adds weight; >=3 = dense register.
+R_REGISTER_KEYWORDS = [
+    # Market / business register
+    "cagr", "compound annual growth rate", "market opportunity", "target audience",
+    "value proposition", "b2b", "b2c", "freemium", "subscription-based", "saas",
+    "market penetration", "customer acquisition", "consumer adoption",
+    "stakeholder", "stakeholders", "ecosystem", "scalability",
+    # Public-health / clinical-literature register
+    "global burden", "burden of disease", "sedentary lifestyle", "prevalence",
+    "mhealth", "telehealth", "digital health", "evidence-based",
+    "clinical integration", "nice guidelines", " who ",
+]
 
 
 # ── file readers ─────────────────────────────────────────────────────────────
@@ -275,6 +301,22 @@ def compute_p_polish(noise_hits: int) -> float:
     else:                  return 0.5   # recurring — typo-dense throughout
 
 
+def compute_r_register(text: str) -> float:
+    """
+    v0.6: register-expansion factor. Counts market/public-health/clinical-literature
+    keywords and returns a multiplier. Replaces the v0.5 manual telehealth +0.10 rule.
+
+    Driven by G8 AI2 pre-submission (Δ −17) and G9 AI1 (Δ −34) misses where clean
+    register-consistent prose flagged wholesale despite weak per-paragraph S4b hits.
+    """
+    lower = " " + text.lower() + " "
+    hits = sum(1 for kw in R_REGISTER_KEYWORDS if kw in lower)
+    if hits >= 3:   return 1.15
+    elif hits == 2: return 1.10
+    elif hits == 1: return 1.05
+    else:           return 1.00
+
+
 def compute_fp_factor(text: str) -> float:
     """
     v0.5 first-person / voice-register factor.
@@ -380,17 +422,91 @@ def ruler_pass(paragraph: str) -> dict:
     metrics["noise_hits"] = noise
     metrics["noisy"] = noise >= 3  # kept for legacy display; p_polish is the v0.5 factor
 
-    # ── v0.5 continuous score ────────────────────────────────────────────────
-    s_struct  = compute_s_struct(flags, metrics)
-    p_polish  = compute_p_polish(noise)
-    fp_factor = compute_fp_factor(paragraph)
-    ai_para   = round(s_struct * p_polish * fp_factor, 3)
-    metrics["s_struct"]  = round(s_struct, 3)
-    metrics["p_polish"]  = p_polish
-    metrics["fp_factor"] = fp_factor
-    metrics["ai_para"]   = ai_para
+    # ── v0.6 continuous score ────────────────────────────────────────────────
+    s_struct   = compute_s_struct(flags, metrics)
+    p_polish   = compute_p_polish(noise)
+    fp_factor  = compute_fp_factor(paragraph)
+    r_register = compute_r_register(paragraph)
+    ai_para    = round(min(s_struct * p_polish * fp_factor * r_register, 1.0), 3)
+    metrics["s_struct"]   = round(s_struct, 3)
+    metrics["p_polish"]   = p_polish
+    metrics["fp_factor"]  = fp_factor
+    metrics["r_register"] = r_register
+    metrics["ai_para"]    = ai_para
+    # pre-floor ai_para preserved so post-processing passes can show their effect
+    metrics["ai_para_raw"] = ai_para
 
     return {"flags": flags, "metrics": metrics}
+
+
+# ── v0.6 post-processing passes ────────────────────────────────────────────
+
+def apply_section_floor(paragraphs: list, results: list) -> int:
+    """
+    v0.6 pass 1: section-level floor. Scan contiguous runs of >=3 paragraphs; when
+    >=60% score MEDIUM or above, floor remaining paragraphs in the run at LOW
+    (ai_para >= 0.10). Only suppresses CLEAR inside otherwise-flagged runs — never
+    raises above LOW minimum.
+
+    Returns the number of paragraphs lifted by the pass (for diagnostic output).
+    """
+    MIN_RUN = 3
+    THRESHOLD = 0.60
+    FLOOR = 0.10
+    lifted = 0
+
+    # Treat every qualifying paragraph as part of a single contiguous run for now.
+    # Section boundaries are hard to infer from normalised text; a whole-document run
+    # still correctly identifies high-register documents. If this over-floors on a
+    # mixed document, we can tighten to heading-delimited runs in v0.7.
+    qualifying_idx = [i for i, p in enumerate(paragraphs) if len(p.split()) >= 20]
+    if len(qualifying_idx) < MIN_RUN:
+        return 0
+
+    medium_plus = sum(
+        1 for i in qualifying_idx
+        if results[i]["metrics"].get("ai_para", 0) >= 0.30
+    )
+    if medium_plus / len(qualifying_idx) < THRESHOLD:
+        return 0
+
+    for i in qualifying_idx:
+        ai = results[i]["metrics"].get("ai_para", 0)
+        if ai < FLOOR:
+            results[i]["metrics"]["ai_para"] = FLOOR
+            results[i]["metrics"]["v06_section_floor"] = True
+            lifted += 1
+    return lifted
+
+
+def apply_polish_floor(paragraphs: list, results: list) -> int:
+    """
+    v0.6 pass 2: polish-aware CLEAR downgrade. When document clean_ratio >= 0.70
+    (>= 70% of qualifying paragraphs have <=1 noise hit), floor every paragraph at
+    LOW (ai_para >= 0.10). Polished documents get no CLEAR outputs.
+    """
+    FLOOR = 0.10
+    lifted = 0
+
+    qualifying_idx = [i for i, p in enumerate(paragraphs) if len(p.split()) >= 20]
+    if not qualifying_idx:
+        return 0
+
+    clean_count = sum(
+        1 for i in qualifying_idx
+        if results[i]["metrics"].get("noise_hits", 0) <= 1
+    )
+    clean_ratio = clean_count / len(qualifying_idx)
+    if clean_ratio < 0.70:
+        return 0
+
+    for i in qualifying_idx:
+        ai = results[i]["metrics"].get("ai_para", 0)
+        if ai < FLOOR:
+            results[i]["metrics"]["ai_para"] = FLOOR
+            results[i]["metrics"]["v06_polish_floor"] = True
+            lifted += 1
+    return lifted
 
 
 # ── packet assembly ───────────────────────────────────────────────────────────
@@ -436,15 +552,17 @@ def severity(flags: list, metrics: dict = None) -> str:
 
 def estimate_ai_score(paragraphs: list, results: list) -> int:
     """
-    v0.5 word-weighted continuous score.
+    v0.6 word-weighted continuous score.
     Score = Σ(ai_para × word_count) / Σ(word_count) across all qualifying paragraphs.
     Qualifying threshold: ≥20 words (matches MIN_PARA_WORDS — full document coverage,
-    no fixed-paragraph ceiling).
+    no fixed-paragraph ceiling). Reads ai_para *after* v0.6 post-processing passes.
 
-    Calibration (v0.5 ruler-only — Claude's full 8-signal pass is more accurate):
-        Huewrite R3   ~20% ruler  vs  <20% actual  (Δ ~0)
-        G8 AI2        ~65% ruler  vs   69% actual  (Δ −4)
-        G7 AI1       ~45% ruler  vs   47% actual  (Δ ~0)
+    Calibration (ruler-only — Claude's full 8-signal pass is more accurate):
+        Huewrite R3   ~20% ruler  vs  <20% actual  (Δ ~0, v0.5 baseline)
+        G8 AI2        ~65% ruler  vs   69% actual  (Δ −4, v0.5 baseline)
+        G7 AI1        ~45% ruler  vs   47% actual  (Δ ~0, v0.5 baseline)
+        G8 AI2 pre    ~63% target vs   69% actual  (v0.6 estimate, closes 11pt of 17pt gap)
+        G9 AI1        ~50% target vs   62% actual  (v0.6 estimate, closes 22pt of 34pt gap)
     """
     MIN_SCORE_WDS = 20  # matches MIN_PARA_WORDS — include all qualifying paragraphs
     total_words   = 0
@@ -474,8 +592,8 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "1. **Signal reference (S1–S8, with S4 split into S4a/S4b)** and **Technique reference (T1–T9)**\n"
         "2. **Before/after examples** from the real corpus\n"
         "3. **The document under review**, split into numbered paragraphs with a ruler-pass "
-        "fingerprint. Each paragraph shows its v0.5 continuous score: "
-        "`ai_para = s_struct × p_polish × fp_factor`\n\n"
+        "fingerprint. Each paragraph shows its v0.6 continuous score: "
+        "`ai_para = min(s_struct × p_polish × fp_factor × r_register, 1.0)`\n\n"
         "### Your task\n\n"
         "For each paragraph:\n"
         "- Review the ruler fingerprint AND the paragraph text\n"
@@ -485,11 +603,11 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "three S4b patterns: abstract-noun chains, nominalised outcomes, abstract-noun triplets. "
         "Diagnostic: strip every concrete noun from a candidate sentence — if it still parses meaningfully, "
         "the cluster is present.\n"
-        "- Compute your own ai_para estimate (see v0.5 rules below) and compare to the ruler's.\n"
+        "- Compute your own ai_para estimate (see v0.6 rules below) and compare to the ruler's.\n"
         "- For every paragraph with ai_para ≥ 0.30 (MEDIUM or above), write a **concrete rewrite suggestion** "
         "naming the specific T-technique(s) applied. Prioritise T5b when S4b is present.\n\n"
-        "### Scoring rules (v0.5 — mandatory)\n\n"
-        "**Formula:** `AI_para = S_struct × P_polish × first_person_factor`\n\n"
+        "### Scoring rules (v0.6 — mandatory)\n\n"
+        "**Formula:** `AI_para = min(S_struct × P_polish × first_person_factor × R_register, 1.0)`\n\n"
         "**S_struct (additive, capped at 1.0):**\n"
         "- S2 uniform burstiness: +0.15\n"
         "- S3 scaffold shape (synthesis closer / full topic→support→synthesis): +0.15 to +0.20\n"
@@ -504,16 +622,37 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "**P_polish (multiplicative):** clean=1.0 · light typos=0.9 · moderate=0.8 · heavy=0.7 · recurring=0.5\n\n"
         "**first_person_factor:** sustained we/our/you/your ≥4% of words=0.8 · "
         "≥2 contractions=0.9 · light markers=0.95 · formal third-person=1.0\n\n"
+        "**R_register (NEW in v0.6, multiplicative):** Keyword-bucket detector for "
+        "market/public-health/clinical-literature register. Replaces the v0.5 manual "
+        "telehealth +0.10 rule. Keyword buckets:\n"
+        "  - Market/business: CAGR, compound annual growth rate, market opportunity, target "
+        "audience, value proposition, B2B, B2C, freemium, subscription-based, SaaS, scalability, "
+        "market penetration, customer acquisition, consumer adoption, stakeholder, ecosystem\n"
+        "  - Public-health / clinical-literature: global burden, burden of disease, WHO, NICE, "
+        "prevalence, sedentary lifestyle, mHealth, telehealth, digital health, evidence-based, "
+        "clinical integration\n"
+        "  - 0 matches=1.00 · 1=1.05 · 2=1.10 · ≥3=1.15\n\n"
         "**Display bands:** HIGH ≥0.55 · MEDIUM 0.30–0.54 · LOW 0.10–0.29 · CLEAR <0.10\n\n"
-        "**Key calibration notes (v0.5):**\n"
+        "**Post-processing passes (NEW in v0.6 — applied by the ruler before you see the score):**\n"
+        "- **Section-level floor:** when ≥60% of qualifying paragraphs score MEDIUM+, remaining "
+        "paragraphs are lifted to LOW (ai_para ≥ 0.10). Never promotes above LOW — only removes CLEAR.\n"
+        "- **Polish-aware CLEAR downgrade:** when document clean_ratio (paragraphs with ≤1 noise hit) "
+        "≥ 0.70, all paragraphs floor at LOW. Polished documents get no CLEAR outputs.\n"
+        "- Look for `v06_section_floor` / `v06_polish_floor` markers on the ruler fingerprint — "
+        "these indicate a paragraph that would otherwise have been CLEAR but was lifted by post-processing.\n\n"
+        "**Key calibration notes (v0.6):**\n"
         "- S4b still dominates but is no longer a hard gate — a paragraph with S2+S3+S6+S5 "
         "but no S4b can reach MEDIUM on its own (~0.60 uncapped, ~0.50–0.60 × p_polish). "
         "This closes the Huewrite/Dwayne R2 under-prediction gaps from v0.4.\n"
         "- First-person / conversational prose genuinely suppresses Turnitin — confirmed "
         "in Huewrite R3 where conversational paragraphs carrying structural signals still cleared.\n"
-        "- Open calibration issue: telehealth/mHealth scaffolded prose in market-analysis / "
-        "risk sections may be under-scored by S4b Pattern weighting — Turnitin flags these "
-        "more aggressively than S4b regex detects. Flag them manually if you see the pattern.\n\n"
+        "- R_register (v0.6) addresses the G8 AI2 pre-submission Δ −17 and G9 AI1 Δ −34 misses. "
+        "When you see clean market-analysis / public-health / clinical-literature prose, the factor "
+        "lifts ai_para by 5–15% multiplicatively — usually flipping boundary LOW→MEDIUM cases.\n"
+        "- Section-floor and polish-floor passes (v0.6) primarily address CLEAR over-emission. "
+        "If you see a paragraph at ai_para=0.10 with s_struct near zero, it was likely lifted by one "
+        "of the floor passes — do NOT suggest it's a false positive; the document-level context makes "
+        "isolated CLEAR outputs unreliable.\n\n"
         "### Calibration patterns to watch for\n\n"
         "Four patterns have been validated against Turnitin post-hoc and require special handling "
         "— they are the most common sources of severity miscalibration:\n\n"
@@ -688,15 +827,16 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "The HTML structure should be:\n"
         "1. `<h1>` title + print button + `.subtitle` with document name and counts\n"
         "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
-        "assessment (all 8 signals, v0.5 continuous model). "
+        "assessment (all 8 signals, v0.6 continuous model). "
         "Formula: Σ(ai_para × word_count) / Σ(word_count) across all qualifying paragraphs (≥20 words). "
         "Use your own per-paragraph ai_para estimates, not just the ruler's — the ruler misses "
-        "paraphrased S4b forms and can't assess S1/S3(full)/S7. "
+        "paraphrased S4b forms and can't assess S1/S3(full)/S7. Apply R_register to each paragraph "
+        "and the section-floor + polish-floor passes at the end before aggregating. "
         "**Exclude from the denominator:** cover page, Turnitin boilerplate/disclaimer text, "
         "headings-only lines, and reference list entries. "
         "Show the result as a large percentage with a coloured border "
         "(red ≥50%, amber 25–49%, green <25%) and a subtitle: "
-        "'v0.5 continuous model · ±10 pts vs Turnitin'. "
+        "'v0.6 continuous model · ±10 pts vs Turnitin'. "
         "Below it show a thin progress bar in the same colour at that percentage width.\n"
         "3. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
         "3. Summary table (`.summary-table`) with columns: ¶ · Severity · Signals · One-line note\n"
@@ -1114,6 +1254,10 @@ def main():
 
     results = [ruler_pass(p) for p in paragraphs]
 
+    # v0.6 post-processing passes — apply after per-paragraph scoring is complete
+    section_lifted = apply_section_floor(paragraphs, results)
+    polish_lifted  = apply_polish_floor(paragraphs, results)
+
     script_dir = Path(__file__).parent
     signals_ref  = load_file("signals.md",  script_dir)
     fewshots_ref = load_file("fewshots.md", script_dir)
@@ -1130,6 +1274,10 @@ def main():
     print(f"  Total paragraphs : {len(paragraphs)}")
     print(f"  Ruler-flagged    : {flagged}  ({flagged/len(paragraphs):.0%})")
     print(f"  HIGH severity    : {high}")
+    if section_lifted:
+        print(f"  Section floor    : lifted {section_lifted} CLEAR → LOW (>=60% of run scored MEDIUM+)")
+    if polish_lifted:
+        print(f"  Polish floor     : lifted {polish_lifted} CLEAR → LOW (clean_ratio >= 0.70)")
     print(f"\nPacket written to : {output_path}")
     print(f"\nNext: open Claude.ai, start a new chat (use Opus), drag in '{output_path.name}'")
     print("      and send: 'Analyse this document and return an HTML report as an artifact.'")

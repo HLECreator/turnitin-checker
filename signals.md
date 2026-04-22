@@ -1,12 +1,12 @@
 # Signal & Technique Reference — Turnitin AI Detector Playbook
 
-Derived from 8 corpora · 13 reports · ~103,150 words · ~476 flagged segments (BCP2485, IMU). **Model: v0.5** (22 Apr 2026).
+Derived from 8 corpora · 13 reports · ~103,150 words · ~476 flagged segments (BCP2485, IMU). **Model: v0.6** (22 Apr 2026).
 
 ---
 
-## Predictive model — read first (v0.5)
+## Predictive model — read first (v0.6)
 
-**Formula:** `AI_para = S_struct × P_polish × first_person_factor`, word-weighted across all qualifying paragraphs (≥20 words).
+**Formula:** `AI_para = min(S_struct × P_polish × first_person_factor × R_register, 1.0)`, word-weighted across all qualifying paragraphs (≥20 words), with two post-processing passes (section-floor, polish-floor).
 
 **S_struct** is additive (capped at 1.0): S2 +0.15 · S3 +0.175 · S4a +0.10 · S4b-P1 +0.25 · S4b-P2 +0.30 · S4b-P3 +0.35 · S5 +0.10 · S6 +0.175 · S7 +0.10 · S8 +0.10
 
@@ -14,20 +14,43 @@ Derived from 8 corpora · 13 reports · ~103,150 words · ~476 flagged segments 
 
 **first_person_factor:** 0.8 sustained we/our/you/your · 0.9 ≥2 contractions · 0.95 light markers · 1.0 formal
 
+**R_register** (new in v0.6): 1.00 no keywords · 1.05 one · 1.10 two · 1.15 three or more. Keyword buckets:
+- **Market/business:** CAGR, compound annual growth rate, market opportunity, target audience, value proposition, B2B, B2C, freemium, subscription-based, SaaS, scalability, market penetration, customer acquisition, consumer adoption, stakeholder, ecosystem
+- **Public-health / clinical-literature:** global burden, burden of disease, WHO, NICE, prevalence, sedentary lifestyle, mHealth, telehealth, digital health, evidence-based, clinical integration
+
 **Display bands:** HIGH ≥0.55 · MEDIUM 0.30–0.54 · LOW 0.10–0.29 · CLEAR <0.10
 
-**Calibration (three v0.5 runs, Apr 2026):**
-- Huewrite R3: ~20% predicted vs <20% actual (Δ ~0, PyMuPDF-verified)
-- G8 ChiroFlow AI2: ~65% predicted vs 69% actual (Δ −4, 80–85% paragraph-level alignment)
-- G7 Moveeeeenow! AI1: ~45% predicted vs 47% actual (Δ ~0, 5/6 heavy-hitter alignment)
+**Post-processing pass 1 — section-level floor:** scan contiguous paragraph runs of ≥3 paragraphs. If ≥60% score MEDIUM or above, raise the remaining paragraphs in that run to at least LOW (ai_para ≥ 0.10). Addresses the G9 AI1 Executive Summary / Background failure where individual CLEAR paragraphs flagged wholesale.
 
-**Open issue (v0.6 watch):** Telehealth/mHealth scaffolded prose in market-analysis, target-audience, competition, and risk-mitigation sections flags more in Turnitin than S4b Pattern regex detects. Count 3 — re-weighting due. For now, manually raise ai_para by +0.10 when you read this register even without a full Pattern 1/2/3 hit.
+**Post-processing pass 2 — polish-aware CLEAR downgrade:** compute document `clean_ratio` = (paragraphs with noise_hits ≤ 1) / total. When `clean_ratio ≥ 0.70`, floor every paragraph at LOW. Polished documents get no CLEAR outputs. Addresses G9 ¶7, ¶16, ¶17 (three CLEAR predictions in a 62%-flagged document).
 
-**Retained findings from v0.4:**
+**Calibration:**
+
+| Run | Predicted | Actual | Δ | Notes |
+|---|---|---|---|---|
+| Huewrite R3 (v0.5) | ~20% | <20% | ~0 | PyMuPDF-verified |
+| G8 ChiroFlow AI2 overlap (v0.5) | ~65% | 69% | −4 | 80–85% paragraph-level alignment |
+| G7 Moveeeeenow! AI1 (v0.5) | ~45% | 47% | ~0 | 5/6 heavy-hitter alignment |
+| G8 ChiroFlow AI2 pre-submission (v0.5) | 52% | 69% | **−17** | Drove v0.6 register expansion |
+| G9 SpinalSense AI1 (v0.5) | 28% | 62% | **−34** | Largest v0.5 miss. 24 MEDIUM + 24 LOW + 3 CLEAR in a 62% doc. Drove v0.6 section-floor and polish-floor passes. |
+
+**v0.6 expected calibration (re-scoring estimate):**
+- G8 AI2 pre-submission: 52% → ~63% (closes 11pt of 17pt gap)
+- G9 AI1: 28% → ~50% (closes 22pt of 34pt gap)
+- Full closure deferred to v0.7 pending a document-level register-density term.
+
+**Rollback condition:** if v0.6 over-shoots Huewrite R3 / G8 AI2 overlap / G7 AI1 on re-scoring by more than 10pt, revert R_register upper bound from 1.15 → 1.10. Section-floor and polish-floor passes only suppress CLEAR and cannot over-shoot on their own.
+
+**Retained findings from v0.4–v0.5:**
 - S4b is still the dominant signal and the highest-leverage rewrite target (T5b)
 - S2, S3, S6 are no longer gated behind S4b but still carry lower weights on their own
-- Grammatical noise suppresses Turnitin flags — now modelled as P_polish multiplier, not a binary step-down
-- First-person / conversational voice genuinely clears paragraphs — now modelled as first_person_factor
+- Grammatical noise suppresses Turnitin flags — modelled as P_polish multiplier, not a binary step-down
+- First-person / conversational voice genuinely clears paragraphs — modelled as first_person_factor
+- Phased-prose MEDIUM floor (S3 sub-rule) — retained
+
+**Deprecated in v0.6:**
+- Manual +0.10 telehealth register adjustment — superseded by R_register keyword bucket
+- CLEAR band as a first-class output — in polished documents, CLEAR is downgraded to LOW by pass 2
 
 ---
 
@@ -110,6 +133,26 @@ The mechanism appears to be that Turnitin's perplexity model reads grammatical n
 
 ### S4b-gating rule [v0.5 update — soft gate, not hard cap]
 **S4b still carries the highest weight, but is no longer a hard gate for HIGH.** In v0.5, a paragraph with S2+S3+S6+S5 but no S4b can reach a raw S_struct of ~0.60, which × P_polish × fp_factor often lands in the MEDIUM band. The old v0.4 hard cap caused systematic under-prediction on Huewrite R2 (−21pp) and Dwayne R2 (−34pp). When S4b IS present, it remains the primary rewrite target (T5b) — removing it drops S_struct by 0.25–0.90 depending on which patterns fire.
+
+### Register-expansion factor [v0.6 — NEW]
+**R_register captures what S4b regex alone misses.** Turnitin flags *register* as well as structure. Prose that reads as "a consultant wrote this for a healthcare startup" flags aggressively regardless of whether any given sentence carries a full Pattern 1/2/3 S4b hit. The v0.5 open issue covered only telehealth/mHealth vocabulary; v0.6 broadens to business-proposal, market-analysis, public-health, and clinical-literature keyword buckets. Count co-occurring keywords per paragraph:
+
+| Matches | R_register | Typical appearance |
+|---|---|---|
+| 0 | 1.00 | domain-neutral prose, personal narrative, direct-method descriptions |
+| 1 | 1.05 | a single market/clinical term in otherwise neutral prose |
+| 2 | 1.10 | moderate — what the v0.5 telehealth manual rule caught |
+| ≥3 | 1.15 | dense — Executive Summary, Market Analysis, Background (public-health), Risk Analysis |
+
+R_register multiplies the final ai_para, so its effect compounds with S_struct. A paragraph at S_struct=0.45 × P_polish=1.0 × fp_factor=1.0 × R_register=1.10 lands at 0.495 (MEDIUM). The same paragraph without register keywords lands at 0.45 (also MEDIUM) — the factor moves the needle mostly in boundary cases between LOW/MEDIUM, not in clearly-HIGH territory. Capped at 1.0 by the outer `min()`.
+
+### Section-level floor [v0.6 — NEW, post-processing]
+**Turnitin scores sections as well as paragraphs.** The G9 AI1 Executive Summary had eight paragraphs averaging LOW individually but the whole section was cyan-highlighted. Mechanism hypothesis: Turnitin's per-paragraph classifier agrees with v0.5 on each paragraph, but an outer "register-consistency" classifier flags contiguous runs of consistent-register prose even when individual paragraphs score weakly.
+
+Implementation: after per-paragraph scoring, scan contiguous runs of ≥3 paragraphs. If ≥60% of the run scores MEDIUM or above, promote the remaining paragraphs to at least LOW (ai_para ≥ 0.10). Never raises anything above LOW minimum — this rule only *prevents CLEAR* inside otherwise-flagged runs.
+
+### Polish-aware CLEAR downgrade [v0.6 — NEW, document-level]
+**CLEAR is only reliable in noisy documents.** In polished documents (few typos, clean grammar throughout), v0.5 over-emits CLEAR because the per-paragraph moderator cannot see document-level register. Rule: compute `clean_ratio` = (paragraphs with noise_hits ≤ 1) / total. When `clean_ratio ≥ 0.70`, floor every paragraph at LOW (ai_para ≥ 0.10). This is a conservative pass — it only removes the CLEAR band, never promotes to MEDIUM.
 
 ---
 
