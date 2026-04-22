@@ -1,18 +1,33 @@
 # Signal & Technique Reference — Turnitin AI Detector Playbook
 
-Derived from 8 corpora · 13 reports · ~103,150 words · ~476 flagged segments (BCP2485, IMU).
+Derived from 8 corpora · 13 reports · ~103,150 words · ~476 flagged segments (BCP2485, IMU). **Model: v0.5** (22 Apr 2026).
 
 ---
 
-## Predictive calibration — read first
+## Predictive model — read first (v0.5)
 
-The signal weights below are derived from **post-hoc analysis** of Turnitin-scored documents. In the one validated pre-submission prediction on record (Shawn's Group BP2, April 2026), the 8-signal model predicted **76%** AI and Turnitin returned **20%** — a −56 point over-prediction. The miss came from three specific over-weightings, all corrected in the rules below:
+**Formula:** `AI_para = S_struct × P_polish × first_person_factor`, word-weighted across all qualifying paragraphs (≥20 words).
 
-1. **S3 (scaffold shape) alone does not flag.** Fully-scaffolded paragraphs with clean topic → support → synthesis structure cleared when they lacked S4b vocabulary and contained grammatical noise. Scaffold is a *shape correlate*, not a trigger.
-2. **S2 (uniform sentence length) alone does not flag.** Requires co-occurrence with S4b consulting-register vocabulary to activate. Tight 15–30 word banding in grammatically-noisy prose cleared.
-3. **S6 (meta-openers) can clear when surrounded by grammatical noise.** Meta-commentary in the cleanest paragraphs flagged; meta-commentary wrapped in broken syntax, typos, or incomplete sentences cleared.
+**S_struct** is additive (capped at 1.0): S2 +0.15 · S3 +0.175 · S4a +0.10 · S4b-P1 +0.25 · S4b-P2 +0.30 · S4b-P3 +0.35 · S5 +0.10 · S6 +0.175 · S7 +0.10 · S8 +0.10
 
-**The single strongest flagging fingerprint is S4b — the consulting-register abstract-noun cluster** (see below). Without S4b, the other signals are correlates at best. Severity classification MUST cap at MEDIUM when S4b is absent.
+**P_polish:** 1.0 clean · 0.9 light typos · 0.8 moderate · 0.7 heavy · 0.5 recurring
+
+**first_person_factor:** 0.8 sustained we/our/you/your · 0.9 ≥2 contractions · 0.95 light markers · 1.0 formal
+
+**Display bands:** HIGH ≥0.55 · MEDIUM 0.30–0.54 · LOW 0.10–0.29 · CLEAR <0.10
+
+**Calibration (three v0.5 runs, Apr 2026):**
+- Huewrite R3: ~20% predicted vs <20% actual (Δ ~0, PyMuPDF-verified)
+- G8 ChiroFlow AI2: ~65% predicted vs 69% actual (Δ −4, 80–85% paragraph-level alignment)
+- G7 Moveeeeenow! AI1: ~45% predicted vs 47% actual (Δ ~0, 5/6 heavy-hitter alignment)
+
+**Open issue (v0.6 watch):** Telehealth/mHealth scaffolded prose in market-analysis, target-audience, competition, and risk-mitigation sections flags more in Turnitin than S4b Pattern regex detects. Count 3 — re-weighting due. For now, manually raise ai_para by +0.10 when you read this register even without a full Pattern 1/2/3 hit.
+
+**Retained findings from v0.4:**
+- S4b is still the dominant signal and the highest-leverage rewrite target (T5b)
+- S2, S3, S6 are no longer gated behind S4b but still carry lower weights on their own
+- Grammatical noise suppresses Turnitin flags — now modelled as P_polish multiplier, not a binary step-down
+- First-person / conversational voice genuinely clears paragraphs — now modelled as first_person_factor
 
 ---
 
@@ -93,8 +108,8 @@ If a paragraph contains visible grammatical noise — broken syntax, obvious typ
 
 The mechanism appears to be that Turnitin's perplexity model reads grammatical noise as human authorship evidence strong enough to outweigh structural signals. When the prose is clean *and* carries S4b, the cluster wins. When prose is noisy, noise wins.
 
-### S4b-gating rule [severity ceiling]
-**HIGH severity requires S4b presence.** If a paragraph shows S2+S3+S6+S1 but lacks the consulting-register cluster (abstract-noun chains, nominalised outcomes, or abstract-noun triplets), cap severity at MEDIUM. This single rule would have flipped the Shawn BP2 prediction from 76% to roughly 35%, closing most of the −56pt miss.
+### S4b-gating rule [v0.5 update — soft gate, not hard cap]
+**S4b still carries the highest weight, but is no longer a hard gate for HIGH.** In v0.5, a paragraph with S2+S3+S6+S5 but no S4b can reach a raw S_struct of ~0.60, which × P_polish × fp_factor often lands in the MEDIUM band. The old v0.4 hard cap caused systematic under-prediction on Huewrite R2 (−21pp) and Dwayne R2 (−34pp). When S4b IS present, it remains the primary rewrite target (T5b) — removing it drops S_struct by 0.25–0.90 depending on which patterns fire.
 
 ---
 

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Turnitin AI Checker — v0.4
+Turnitin AI Checker — v0.5
 Run: python check.py <document.docx|document.pdf>
 Output: <docname>_packet.md — drag into Claude.ai (Opus) for a flagged HTML report.
 
-v0.4 — Shawn BP2 calibration update (13 reports, ~476 segments):
-- S4 split into S4a (generic LLM vocab) and S4b (consulting-register cluster — true fingerprint)
-- Severity weights lowered to correct prior over-prediction (76% predicted vs 20% actual, −56pt miss)
-- HIGH severity requires S4b presence (gating rule)
-- Grammatical-noise moderator: prompts Claude to reduce severity one step when noise is present
-- S2/S3/S6 downgraded to correlates — they no longer flag on their own without S4b co-occurrence
+v0.5 — Continuous per-paragraph scoring (22 Apr 2026, 8 corpora, 13 reports, ~103,150 words):
+- Replaces v0.4 four-band categorical output (CLEAR/LOW/MEDIUM/HIGH + S4b hard gate)
+- Formula: AI_para = S_struct × P_polish × first_person_factor, bounded [0, 1]
+- S_struct: additive per-signal weights (see compute_s_struct()); no S4b gating required for HIGH
+- P_polish: multiplicative noise moderator (1.0 clean → 0.5 recurring noise)
+- first_person_factor: voice-register moderator (0.8 sustained first/second-person, 0.9 contractions)
+- Document score: word-weighted average of AI_para across all qualifying paragraphs (≥20 words)
+- Removes v0.3/v0.4 fixed 7-paragraph ceiling — full document coverage
+- Calibration: Huewrite R3 ~20% vs <20% actual; G8 AI2 ~65% vs 69%; G7 AI1 ~45% vs 47%
+- Open issue (v0.6 target): S4b-gating too strict on telehealth/mHealth scaffolded prose
 """
 
 import sys
@@ -239,6 +243,58 @@ def noise_hits(text: str) -> int:
     return sum(len(r.findall(text)) for r in NOISE_RE)
 
 
+def compute_s_struct(flags: list, metrics: dict) -> float:
+    """
+    v0.5: Additive S_struct from detected signals, capped at 1.0.
+    Each signal contributes independently — no S4b hard gate.
+    S4b still carries the highest weight (up to 0.90 if all three patterns fire).
+    """
+    s = 0.0
+    if metrics.get("s2_correlate"):         s += 0.15   # S2 uniform burstiness
+    if metrics.get("synthesis_closer"):     s += 0.175  # S3 scaffold shape (closer proxy)
+    if "S4a" in flags:                      s += 0.10   # S4a generic LLM vocab
+    if metrics.get("s4b_chain", 0) > 0:    s += 0.25   # S4b Pattern 1 — abstract-noun chains
+    if metrics.get("s4b_nominal", 0) > 0:  s += 0.30   # S4b Pattern 2 — nominalised outcomes
+    if metrics.get("s4b_triplet", 0) > 0:  s += 0.35   # S4b Pattern 3 — abstract-noun triplets
+    if metrics.get("triplets", 0) >= 2:    s += 0.10   # S5 rule-of-three / smooth connectives
+    if metrics.get("formulaic_opener"):     s += 0.175  # S6 meta-opener / meta-closer
+    if "S8" in flags:                       s += 0.10   # S8 register uniformity / low vocab diversity
+    # S7 (citation-anchored triplets) — cannot reliably detect with ruler; Claude applies it
+    return min(s, 1.0)
+
+
+def compute_p_polish(noise_hits: int) -> float:
+    """
+    v0.5 grammatical-noise moderator as multiplicative factor.
+    Replaces the step-down "noisy" boolean from v0.4.
+    """
+    if noise_hits == 0:    return 1.0   # clean prose
+    elif noise_hits <= 2:  return 0.9   # light typos / one agreement slip
+    elif noise_hits <= 4:  return 0.8   # moderate — two or three slips
+    elif noise_hits <= 7:  return 0.7   # heavy — multiple typos + broken clause
+    else:                  return 0.5   # recurring — typo-dense throughout
+
+
+def compute_fp_factor(text: str) -> float:
+    """
+    v0.5 first-person / voice-register factor.
+    Sustained first/second-person address or contraction use reduces AI_para.
+    """
+    words = re.findall(r"\b\w+\b", text.lower())
+    total = len(words) or 1
+    fp_words = sum(1 for w in words if w in {"we", "our", "you", "your"})
+    contractions = len(re.findall(
+        r"\b(it's|don't|can't|won't|we're|we've|they're|you're|isn't|"
+        r"wasn't|weren't|haven't|hasn't|hadn't|doesn't|didn't|i'm|i've|i'd|i'll)\b",
+        text, re.IGNORECASE,
+    ))
+    fp_density = fp_words / total
+    if fp_density >= 0.04:          return 0.8   # sustained first/second-person
+    elif contractions >= 2:         return 0.9   # conversational register
+    elif fp_words > 0 or contractions > 0: return 0.95  # light voice markers
+    return 1.0                                   # third-person formal — no modifier
+
+
 def ruler_pass(paragraph: str) -> dict:
     sentences = split_sentences(paragraph)
     flags = []
@@ -302,7 +358,17 @@ def ruler_pass(paragraph: str) -> dict:
     # Grammatical-noise moderator count
     noise = noise_hits(paragraph)
     metrics["noise_hits"] = noise
-    metrics["noisy"] = noise >= 3
+    metrics["noisy"] = noise >= 3  # kept for legacy display; p_polish is the v0.5 factor
+
+    # ── v0.5 continuous score ────────────────────────────────────────────────
+    s_struct  = compute_s_struct(flags, metrics)
+    p_polish  = compute_p_polish(noise)
+    fp_factor = compute_fp_factor(paragraph)
+    ai_para   = round(s_struct * p_polish * fp_factor, 3)
+    metrics["s_struct"]  = round(s_struct, 3)
+    metrics["p_polish"]  = p_polish
+    metrics["fp_factor"] = fp_factor
+    metrics["ai_para"]   = ai_para
 
     return {"flags": flags, "metrics": metrics}
 
@@ -318,78 +384,58 @@ def load_file(name: str, script_dir: Path) -> str:
 
 def severity(flags: list, metrics: dict = None) -> str:
     """
-    Classify paragraph severity with v0.4 calibration rules:
+    v0.5: Convert continuous ai_para score to display band for the packet.
+    Thresholds: HIGH ≥0.55 · MEDIUM ≥0.30 · LOW ≥0.10 · CLEAR <0.10
 
-    - HIGH requires S4b presence (consulting-register cluster). Without S4b,
-      severity caps at MEDIUM regardless of other signal count.
-    - Grammatical noise (metrics["noisy"]) reduces severity by one step as a
-      passive clearance moderator (Shawn BP2 calibration).
-    - S2, S3, S6 alone are correlates — count them at half weight when S4b
-      is absent.
+    Falls back to flag-count heuristic if ai_para is not yet computed
+    (e.g. when called before ruler_pass has populated metrics).
     """
+    if metrics and "ai_para" in metrics:
+        ai = metrics["ai_para"]
+        if ai >= 0.55:    return "HIGH"
+        elif ai >= 0.30:  return "MEDIUM"
+        elif ai >= 0.10:  return "LOW"
+        else:             return "CLEAR"
+
+    # ── legacy fallback (pre-v0.5 call sites) ───────────────────────────────
     if not flags:
-        base = "CLEAR"
+        return "CLEAR"
+    has_s4b = "S4b" in flags
+    correlate_flags = [f for f in flags if f in {"S2", "S3", "S6", "S5", "S7", "S8"}]
+    strong_flags    = [f for f in flags if f in {"S1", "S4a", "S4b"}]
+    if has_s4b:
+        n = len(flags)
+        base = "HIGH" if n >= 4 else "MEDIUM" if n >= 2 else "LOW"
     else:
-        # Separate S4b from correlates
-        has_s4b = "S4b" in flags
-        correlate_flags = [f for f in flags if f in {"S2", "S3", "S6", "S5", "S7", "S8"}]
-        strong_flags = [f for f in flags if f in {"S1", "S4a", "S4b"}]
-
-        if has_s4b:
-            # S4b present — score by total signal count normally
-            n = len(flags)
-            if n >= 4:
-                base = "HIGH"
-            elif n >= 2:
-                base = "MEDIUM"
-            else:
-                base = "LOW"
-        else:
-            # No S4b — cap at MEDIUM, downweight correlates
-            effective = len(strong_flags) + (len(correlate_flags) / 2)
-            if effective >= 2.5:
-                base = "MEDIUM"
-            elif effective >= 1.0:
-                base = "LOW"
-            else:
-                base = "CLEAR"
-
-    # Grammatical-noise moderator: step down one level
+        effective = len(strong_flags) + len(correlate_flags) / 2
+        base = "MEDIUM" if effective >= 2.5 else "LOW" if effective >= 1.0 else "CLEAR"
     if metrics and metrics.get("noisy"):
         base = {"HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "CLEAR", "CLEAR": "CLEAR"}[base]
-
     return base
 
 
 def estimate_ai_score(paragraphs: list, results: list) -> int:
     """
-    Word-weighted AI score estimate. Mirrors Turnitin's logic:
-    flagged words / total qualifying words.
+    v0.5 word-weighted continuous score.
+    Score = Σ(ai_para × word_count) / Σ(word_count) across all qualifying paragraphs.
+    Qualifying threshold: ≥20 words (matches MIN_PARA_WORDS — full document coverage,
+    no fixed-paragraph ceiling).
 
-    Calibration notes (v0.4 — Shawn BP2 update):
-    - Prior weights (HIGH=0.95, MEDIUM=0.75) over-predicted Shawn BP2 by 56 points
-      (predicted 76%, actual 20%). Weights lowered to reflect that HIGH without
-      S4b is rare and that MEDIUM paragraphs often only contribute ~30–50% of
-      their word count to actual flagging.
-    - Ruler-only weights (this function): HIGH=0.75, MEDIUM=0.45, LOW=0.15.
-    - Claude's HTML report prompt now uses: HIGH=0.70, MEDIUM=0.40, LOW=0.12.
-    - Paragraphs under 50 words excluded from denominator (document furniture).
-    - Validation history:
-        G9 ruler→54% vs Turnitin 62% (v0.3 under-prediction, −8pt)
-        Shawn BP2 Claude→76% vs Turnitin 20% (v0.3 over-prediction, −56pt)
-        Spinability rewrite Claude→36% vs Turnitin 33% (v0.3 fit, +3pt)
+    Calibration (v0.5 ruler-only — Claude's full 8-signal pass is more accurate):
+        Huewrite R3   ~20% ruler  vs  <20% actual  (Δ ~0)
+        G8 AI2        ~65% ruler  vs   69% actual  (Δ −4)
+        G7 AI1       ~45% ruler  vs   47% actual  (Δ ~0)
     """
-    SEV_WEIGHT    = {"HIGH": 0.75, "MEDIUM": 0.45, "LOW": 0.15, "CLEAR": 0.0}
-    MIN_SCORE_WDS = 50  # below this, paragraph is furniture — skip from denominator
+    MIN_SCORE_WDS = 20  # matches MIN_PARA_WORDS — include all qualifying paragraphs
     total_words   = 0
     flagged_words = 0.0
     for para, result in zip(paragraphs, results):
         wc = len(para.split())
         if wc < MIN_SCORE_WDS:
-            continue  # exclude furniture from denominator
+            continue
+        ai_para = result["metrics"].get("ai_para", 0.0)
         total_words   += wc
-        sev = severity(result["flags"], result.get("metrics"))
-        flagged_words += wc * SEV_WEIGHT[sev]
+        flagged_words += wc * ai_para
     if total_words == 0:
         return 0
     return round(flagged_words / total_words * 100)
@@ -403,12 +449,13 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
     lines.append("## Instructions for Claude\n\n")
     lines.append(
         "You are a Turnitin AI-detection expert trained on a live research playbook "
-        "covering 8 corpora, 13 reports, and ~476 flagged segments from IMU BCP2485 proposals.\n\n"
+        "covering 8 corpora, 13 reports, and ~103,150 words from IMU BCP2485 proposals.\n\n"
         "This packet contains:\n"
-        "1. **Signal reference (S1–S8, with S4 split into S4a/S4b)** and **Technique reference (T1–T8)**\n"
+        "1. **Signal reference (S1–S8, with S4 split into S4a/S4b)** and **Technique reference (T1–T9)**\n"
         "2. **Before/after examples** from the real corpus\n"
         "3. **The document under review**, split into numbered paragraphs with a ruler-pass "
-        "fingerprint showing which measurable signals each paragraph tripped\n\n"
+        "fingerprint. Each paragraph shows its v0.5 continuous score: "
+        "`ai_para = s_struct × p_polish × fp_factor`\n\n"
         "### Your task\n\n"
         "For each paragraph:\n"
         "- Review the ruler fingerprint AND the paragraph text\n"
@@ -416,29 +463,37 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "- **Specifically assess S4b (consulting-register cluster) by reading** — the ruler's "
         "pattern-matching catches obvious forms but will miss paraphrased variants. Look for the "
         "three S4b patterns: abstract-noun chains, nominalised outcomes, abstract-noun triplets. "
-        "Run the diagnostic: strip every concrete noun from a candidate sentence — if it still parses, "
+        "Diagnostic: strip every concrete noun from a candidate sentence — if it still parses meaningfully, "
         "the cluster is present.\n"
-        "- Assign severity using the v0.4 calibration rules below.\n"
-        "- For every HIGH or MEDIUM paragraph, write a **concrete rewrite suggestion** "
-        "naming the specific T-technique(s) applied. Prioritise T5b (consulting-register cluster "
-        "removal) — it is the single highest-impact technique when S4b is present.\n\n"
-        "### Severity rules (v0.4 — mandatory)\n\n"
-        "- **HIGH severity REQUIRES S4b presence.** A paragraph without the consulting-register "
-        "cluster (abstract-noun chains, nominalised outcomes, or abstract-noun triplets) caps at "
-        "MEDIUM regardless of how many other signals fire. This is the single most important "
-        "calibration rule — it prevents the overprediction pattern that caused a 76% → 20% miss "
-        "on Shawn BP2.\n"
-        "- **S2, S3, S6 alone do not flag.** Uniform sentence length, scaffolded shape, and "
-        "meta-openers are correlates that amplify S4b. Without S4b, they are insufficient on their "
-        "own to push a paragraph above LOW.\n"
-        "- **Count**: with S4b → HIGH (≥4 signals), MEDIUM (2–3), LOW (1). "
-        "Without S4b → cap at MEDIUM, downweight correlates by half.\n"
-        "- **Grammatical-noise moderator**: if the paragraph contains visible grammatical noise "
-        "(broken syntax, typos, agreement errors, awkward phrasing, run-on fragments), reduce "
-        "classified severity by **one step** (HIGH→MEDIUM, MEDIUM→LOW). The ruler fingerprint "
-        "flags this with the `GRAMMATICAL_NOISE` tag, but you should also apply it when you read "
-        "noise the ruler missed. Noise is a passive clearance mechanism observed in Shawn BP2 — "
-        "do NOT advise writers to introduce typos; just account for their suppressing effect.\n\n"
+        "- Compute your own ai_para estimate (see v0.5 rules below) and compare to the ruler's.\n"
+        "- For every paragraph with ai_para ≥ 0.30 (MEDIUM or above), write a **concrete rewrite suggestion** "
+        "naming the specific T-technique(s) applied. Prioritise T5b when S4b is present.\n\n"
+        "### Scoring rules (v0.5 — mandatory)\n\n"
+        "**Formula:** `AI_para = S_struct × P_polish × first_person_factor`\n\n"
+        "**S_struct (additive, capped at 1.0):**\n"
+        "- S2 uniform burstiness: +0.15\n"
+        "- S3 scaffold shape (synthesis closer / full topic→support→synthesis): +0.15 to +0.20\n"
+        "- S4a generic LLM vocab: +0.10\n"
+        "- S4b Pattern 1 abstract-noun chains: +0.25\n"
+        "- S4b Pattern 2 nominalised outcomes: +0.30\n"
+        "- S4b Pattern 3 abstract-noun triplets: +0.35\n"
+        "- S5 rule-of-three / smooth connectives (≥2 triplets): +0.10\n"
+        "- S6 formulaic meta-opener / closer: +0.15 to +0.20\n"
+        "- S7 citation-anchored triplets: +0.10\n"
+        "- S8 abstract-descriptor density: +0.10\n\n"
+        "**P_polish (multiplicative):** clean=1.0 · light typos=0.9 · moderate=0.8 · heavy=0.7 · recurring=0.5\n\n"
+        "**first_person_factor:** sustained we/our/you/your ≥4% of words=0.8 · "
+        "≥2 contractions=0.9 · light markers=0.95 · formal third-person=1.0\n\n"
+        "**Display bands:** HIGH ≥0.55 · MEDIUM 0.30–0.54 · LOW 0.10–0.29 · CLEAR <0.10\n\n"
+        "**Key calibration notes (v0.5):**\n"
+        "- S4b still dominates but is no longer a hard gate — a paragraph with S2+S3+S6+S5 "
+        "but no S4b can reach MEDIUM on its own (~0.60 uncapped, ~0.50–0.60 × p_polish). "
+        "This closes the Huewrite/Dwayne R2 under-prediction gaps from v0.4.\n"
+        "- First-person / conversational prose genuinely suppresses Turnitin — confirmed "
+        "in Huewrite R3 where conversational paragraphs carrying structural signals still cleared.\n"
+        "- Open calibration issue: telehealth/mHealth scaffolded prose in market-analysis / "
+        "risk sections may be under-scored by S4b Pattern weighting — Turnitin flags these "
+        "more aggressively than S4b regex detects. Flag them manually if you see the pattern.\n\n"
         "### Calibration patterns to watch for\n\n"
         "Four patterns have been validated against Turnitin post-hoc and require special handling "
         "— they are the most common sources of severity miscalibration:\n\n"
@@ -554,17 +609,15 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         "The HTML structure should be:\n"
         "1. `<h1>` title + print button + `.subtitle` with document name and counts\n"
         "2. **Estimated AI score block** — calculate a word-weighted score using your full signal "
-        "assessment (all 8 signals, with v0.4 S4b-gated severity rules above). "
-        "Formula: sum(word_count × severity_weight) / total_qualifying_words × 100, "
-        "where **HIGH=0.70, MEDIUM=0.40, LOW=0.12, CLEAR=0.0**. These weights are recalibrated "
-        "from v0.3 (which were 0.90/0.65/0.20) after the Shawn BP2 over-prediction "
-        "(76% predicted vs 20% actual, −56pt miss). "
+        "assessment (all 8 signals, v0.5 continuous model). "
+        "Formula: Σ(ai_para × word_count) / Σ(word_count) across all qualifying paragraphs (≥20 words). "
+        "Use your own per-paragraph ai_para estimates, not just the ruler's — the ruler misses "
+        "paraphrased S4b forms and can't assess S1/S3(full)/S7. "
         "**Exclude from the denominator:** cover page, Turnitin boilerplate/disclaimer text, "
-        "any paragraph under ~50 words that reads as document furniture rather than substantive prose. "
-        "These would be filtered as non-qualifying by Turnitin's own pipeline. "
+        "headings-only lines, and reference list entries. "
         "Show the result as a large percentage with a coloured border "
         "(red ≥50%, amber 25–49%, green <25%) and a subtitle: "
-        "'v0.4 8-signal estimate (S4b-gated) · ±15 pts vs Turnitin'. "
+        "'v0.5 continuous model · ±10 pts vs Turnitin'. "
         "Below it show a thin progress bar in the same colour at that percentage width.\n"
         "3. Signal legend using `.legend` class — one `.chip` per signal with its short label\n"
         "3. Summary table (`.summary-table`) with columns: ¶ · Severity · Signals · One-line note\n"
@@ -600,6 +653,10 @@ def build_packet(paragraphs: list, results: list, signals_ref: str, fewshots_ref
         flag_str = " · ".join(flags) if flags else "—"
         stdev_str = str(metrics.get("sent_stdev", "n/a"))
         metric_str = (
+            f"ai_para:{metrics.get('ai_para','?')} "
+            f"[s_struct:{metrics.get('s_struct','?')} × "
+            f"p_polish:{metrics.get('p_polish','?')} × "
+            f"fp:{metrics.get('fp_factor','?')}] · "
             f"sent_stdev:{stdev_str} · "
             f"hedges:{metrics['hedge_pct']} · "
             f"ttr:{metrics['ttr']} · "
@@ -703,7 +760,7 @@ def build_rewrite_packet(
     lines.append("## Instructions for Claude\n\n")
     lines.append(
         "You are a Turnitin AI-detection expert trained on a live research playbook "
-        "covering 8 corpora, 13 reports, and ~476 flagged segments from IMU BCP2485 proposals.\n\n"
+        "covering 8 corpora, 13 reports, and ~103,150 words from IMU BCP2485 proposals.\n\n"
         "This packet contains a document that has **already been scored by Turnitin**. "
         "Each paragraph is labelled [FLAGGED] or [CLEAR] based on whether Turnitin's AI "
         "detector cyan-highlighted any of its text. Your task is **targeted rewriting** — "
